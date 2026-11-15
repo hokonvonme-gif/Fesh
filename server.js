@@ -9,6 +9,7 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 const { Server } = require('socket.io');
+const nodemailer = require('nodemailer');
 
 // ─────────────────────────────────────────────
 // MODELS
@@ -56,6 +57,72 @@ const messageSchema = new mongoose.Schema({
 const User = mongoose.model('User', userSchema);
 const Conversation = mongoose.model('Conversation', conversationSchema);
 const Message = mongoose.model('Message', messageSchema);
+
+// ─────────────────────────────────────────────
+// NOTIFICATION EMAIL (boîte de messagerie réelle)
+// Relais comme YAKA : envoi d'un vrai e-mail au destinataire
+// ─────────────────────────────────────────────
+async function notifyRecipientByEmail({ toEmail, toName, fromName, text, conversationTitle }) {
+  if (!toEmail) return;
+
+  // Mode 1 : RELAY_URL = URL Google Apps Script (comme YAKA)
+  // Déploie relay.html sur GitHub Pages (doc) + script Google en Web App
+  const relayUrl = process.env.RELAY_URL;
+  if (relayUrl) {
+    try {
+      const payload = {
+        to: toEmail,
+        toName: toName || '',
+        from: fromName || 'Fesh',
+        subject: conversationTitle
+          ? `Fesh — nouveau message dans « ${conversationTitle} »`
+          : `Fesh — message de ${fromName || 'un étudiant'}`,
+        message: text,
+        app: 'Fesh',
+      };
+      const res = await fetch(relayUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        redirect: 'follow',
+      });
+      console.log(`Relay notification → ${toEmail} status=${res.status}`);
+    } catch (err) {
+      console.error('Relay notification failed:', err.message);
+    }
+    return;
+  }
+
+  // Mode 2 : SMTP direct (Gmail, etc.)
+  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM } = process.env;
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) return;
+
+  try {
+    const transporter = nodemailer.createTransport({
+      host: SMTP_HOST,
+      port: Number(SMTP_PORT || 587),
+      secure: Number(SMTP_PORT || 587) === 465,
+      auth: { user: SMTP_USER, pass: SMTP_PASS },
+    });
+
+    await transporter.sendMail({
+      from: SMTP_FROM || `Fesh <${SMTP_USER}>`,
+      to: toEmail,
+      subject: conversationTitle
+        ? `Fesh — nouveau message dans « ${conversationTitle} »`
+        : `Fesh — message de ${fromName || 'un étudiant'}`,
+      text: `${fromName || 'Un étudiant'} t'a écrit sur Fesh :\n\n${text}\n\n—\nOuvre l'application Fesh pour répondre.`,
+      html: `<p><strong>${fromName || 'Un étudiant'}</strong> t'a écrit sur <strong>Fesh</strong> :</p>
+             <blockquote style="border-left:3px solid #00A884;padding-left:12px;color:#333;">${text}</blockquote>
+             <p style="color:#666;font-size:13px;">Ouvre l'application Fesh pour répondre.</p>`,
+    });
+    console.log(`Email notification sent to ${toEmail}`);
+  } catch (err) {
+    console.error('Email notification failed:', err.message);
+  }
+}
+
+
 
 // ─────────────────────────────────────────────
 // HELPERS
@@ -301,6 +368,28 @@ app.post('/api/chats/:chatId/messages', authenticate, async (req, res, next) => 
     const populated = await message.populate('senderId', 'displayName photoUrl');
     req.app.get('io').to(conversation._id.toString()).emit('message:new', populated);
 
+    // Notifier les autres participants par e-mail (boîte de messagerie réelle)
+    try {
+      const others = await User.find({
+        _id: { $in: conversation.participants, $ne: req.user._id },
+      }).select('email displayName');
+      const fromName = req.user.displayName || 'Un étudiant';
+      const title = conversation.title || '';
+      for (const other of others) {
+        if (other.email) {
+          notifyRecipientByEmail({
+            toEmail: other.email,
+            toName: other.displayName,
+            fromName,
+            text: message.text,
+            conversationTitle: title,
+          }).catch(() => {});
+        }
+      }
+    } catch (notifyErr) {
+      console.error('Notify error:', notifyErr.message);
+    }
+
     res.status(201).json({ success: true, data: { message: populated } });
   } catch (error) {
     next(error);
@@ -389,6 +478,26 @@ io.on('connection', (socket) => {
 
       const populated = await message.populate('senderId', 'displayName photoUrl');
       io.to(conversation._id.toString()).emit('message:new', populated);
+
+      // E-mail aux autres participants
+      try {
+        const others = await User.find({
+          _id: { $in: conversation.participants, $ne: socket.user._id },
+        }).select('email displayName');
+        const fromName = socket.user.displayName || 'Un étudiant';
+        for (const other of others) {
+          if (other.email) {
+            notifyRecipientByEmail({
+              toEmail: other.email,
+              toName: other.displayName,
+              fromName,
+              text: message.text,
+              conversationTitle: conversation.title || '',
+            }).catch(() => {});
+          }
+        }
+      } catch (_) {}
+
       callback({ success: true, data: populated });
     } catch (_error) {
       callback({ success: false, message: 'Impossible d’envoyer le message.' });
