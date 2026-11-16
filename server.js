@@ -5,6 +5,7 @@ const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
 const morgan = require('morgan');
+const rateLimit = require('express-rate-limit');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
@@ -21,13 +22,16 @@ const userSchema = new mongoose.Schema({
   country: { type: String, trim: true, maxlength: 80, default: '' },
   program: { type: String, trim: true, maxlength: 120, default: '' },
   photoUrl: { type: String, default: '' },
-  createdAt: { type: Date, default: Date.now },
 }, { timestamps: true });
 
 const conversationSchema = new mongoose.Schema({
   type: { type: String, enum: ['private', 'group'], default: 'private' },
   title: { type: String, trim: true, default: '' },
-  participants: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true }],
+  description: { type: String, trim: true, default: '' },
+  // Communautés publiques (n'importe qui peut les rejoindre)
+  isPublic: { type: Boolean, default: false },
+  slug: { type: String, trim: true, index: true, sparse: true },
+  participants: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   lastMessage: {
     text: { type: String, default: '' },
@@ -38,95 +42,43 @@ const conversationSchema = new mongoose.Schema({
 conversationSchema.index({ participants: 1, updatedAt: -1 });
 
 const messageSchema = new mongoose.Schema({
-  conversationId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'Conversation',
-    required: true,
-    index: true,
-  },
-  senderId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: 'User',
-    required: true,
-  },
+  conversationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', required: true, index: true },
+  senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   type: { type: String, enum: ['text'], default: 'text' },
   text: { type: String, required: true, trim: true, maxlength: 5000 },
-  createdAt: { type: Date, default: Date.now, index: true },
 }, { timestamps: true });
+messageSchema.index({ conversationId: 1, createdAt: -1 });
 
 const User = mongoose.model('User', userSchema);
 const Conversation = mongoose.model('Conversation', conversationSchema);
 const Message = mongoose.model('Message', messageSchema);
 
-// ─────────────────────────────────────────────
-// NOTIFICATION EMAIL (boîte de messagerie réelle)
-// Relais comme YAKA : envoi d'un vrai e-mail au destinataire
-// ─────────────────────────────────────────────
-async function notifyRecipientByEmail({ toEmail, toName, fromName, text, conversationTitle }) {
-  if (!toEmail) return;
-
-  // Mode 1 : RELAY_URL = URL Google Apps Script (comme YAKA)
-  // Déploie relay.html sur GitHub Pages (doc) + script Google en Web App
-  const relayUrl = process.env.RELAY_URL;
-  if (relayUrl) {
-    try {
-      const payload = {
-        to: toEmail,
-        toName: toName || '',
-        from: fromName || 'Fesh',
-        subject: conversationTitle
-          ? `Fesh — nouveau message dans « ${conversationTitle} »`
-          : `Fesh — message de ${fromName || 'un étudiant'}`,
-        message: text,
-        app: 'Fesh',
-      };
-      const res = await fetch(relayUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        redirect: 'follow',
-      });
-      console.log(`Relay notification → ${toEmail} status=${res.status}`);
-    } catch (err) {
-      console.error('Relay notification failed:', err.message);
-    }
-    return;
-  }
-
-  // Mode 2 : SMTP direct (Gmail, etc.)
-  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM } = process.env;
-  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) return;
-
-  try {
-    const transporter = nodemailer.createTransport({
-      host: SMTP_HOST,
-      port: Number(SMTP_PORT || 587),
-      secure: Number(SMTP_PORT || 587) === 465,
-      auth: { user: SMTP_USER, pass: SMTP_PASS },
-    });
-
-    await transporter.sendMail({
-      from: SMTP_FROM || `Fesh <${SMTP_USER}>`,
-      to: toEmail,
-      subject: conversationTitle
-        ? `Fesh — nouveau message dans « ${conversationTitle} »`
-        : `Fesh — message de ${fromName || 'un étudiant'}`,
-      text: `${fromName || 'Un étudiant'} t'a écrit sur Fesh :\n\n${text}\n\n—\nOuvre l'application Fesh pour répondre.`,
-      html: `<p><strong>${fromName || 'Un étudiant'}</strong> t'a écrit sur <strong>Fesh</strong> :</p>
-             <blockquote style="border-left:3px solid #00A884;padding-left:12px;color:#333;">${text}</blockquote>
-             <p style="color:#666;font-size:13px;">Ouvre l'application Fesh pour répondre.</p>`,
-    });
-    console.log(`Email notification sent to ${toEmail}`);
-  } catch (err) {
-    console.error('Email notification failed:', err.message);
-  }
-}
-
-
+const DEFAULT_COMMUNITIES = [
+  { slug: 'international', title: 'Étudiants internationaux', description: 'Accueil et partage d’expériences' },
+  { slug: 'arrival', title: 'Préparer son arrivée', description: 'Documents, voyage, démarches' },
+  { slug: 'housing', title: 'Logement à Accra', description: 'Colocs, quartiers et bons plans' },
+  { slug: 'admission', title: 'Admissions & visa', description: 'Étapes, dossiers et conseils' },
+  { slug: 'daily-life', title: 'Vie à Accra', description: 'Transport, nourriture, budget' },
+  { slug: 'engineering', title: 'Génie électrique', description: 'Cours, projets et entraide' },
+];
 
 // ─────────────────────────────────────────────
 // HELPERS
 // ─────────────────────────────────────────────
+const EMAIL_RE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
+const escapeHtml = (s) => String(s).replace(/[&<>"']/g, (c) => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+}[c]));
+
+const escapeRegex = (s) => String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+function httpError(status, message) {
+  const err = new Error(message);
+  err.status = status;
+  return err;
+}
+
 function createToken(userId) {
   if (!process.env.JWT_SECRET) throw new Error('JWT_SECRET manquant.');
   return jwt.sign({ sub: userId.toString() }, process.env.JWT_SECRET, {
@@ -165,25 +117,13 @@ async function authenticate(req, res, next) {
 }
 
 // ─────────────────────────────────────────────
-// DATABASE
-// ─────────────────────────────────────────────
-async function connectDatabase() {
-  const uri = process.env.MONGODB_URI;
-  if (!uri) throw new Error('La variable MONGODB_URI est absente du fichier .env.');
-  mongoose.set('strictQuery', true);
-  await mongoose.connect(uri, { serverSelectionTimeoutMS: 15000 });
-  console.log(`MongoDB connected: ${mongoose.connection.name}`);
-}
-
-// ─────────────────────────────────────────────
 // APP + SOCKET.IO
 // ─────────────────────────────────────────────
 const app = express();
 const server = http.createServer(app);
+app.set('trust proxy', 1); // Render / reverse proxy
 
-const allowedOrigins = (process.env.CORS_ORIGIN || '*')
-  .split(',')
-  .map((origin) => origin.trim());
+const allowedOrigins = (process.env.CORS_ORIGIN || '*').split(',').map((o) => o.trim());
 
 app.use(helmet());
 app.use(cors({
@@ -198,40 +138,156 @@ app.use(express.json({ limit: '1mb' }));
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 const io = new Server(server, {
-  cors: {
-    origin: allowedOrigins.includes('*') ? '*' : allowedOrigins,
-    methods: ['GET', 'POST'],
-  },
+  cors: { origin: allowedOrigins.includes('*') ? '*' : allowedOrigins, methods: ['GET', 'POST'] },
 });
-app.set('io', io);
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 30,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Trop de tentatives. Réessaie dans quelques minutes.' },
+});
+
+// ─────────────────────────────────────────────
+// NOTIFICATIONS E-MAIL (seulement si hors ligne + anti-spam)
+// ─────────────────────────────────────────────
+const NOTIFY_COOLDOWN_MS = Number(process.env.NOTIFY_COOLDOWN_MIN || 10) * 60 * 1000;
+const lastNotified = new Map(); // "userId:chatId" -> timestamp
+
+function isOnline(userId) {
+  const room = io.sockets.adapter.rooms.get(`user:${userId}`);
+  return !!room && room.size > 0;
+}
+
+function shouldNotify(userId, chatId) {
+  if (isOnline(userId)) return false;
+  const key = `${userId}:${chatId}`;
+  const last = lastNotified.get(key) || 0;
+  if (Date.now() - last < NOTIFY_COOLDOWN_MS) return false;
+  lastNotified.set(key, Date.now());
+  if (lastNotified.size > 5000) lastNotified.clear();
+  return true;
+}
+
+async function notifyRecipientByEmail({ toEmail, toName, fromName, text, conversationTitle }) {
+  if (!toEmail) return;
+  const subject = conversationTitle
+    ? `Fesh — nouveau message dans « ${conversationTitle} »`
+    : `Fesh — message de ${fromName || 'un étudiant'}`;
+
+  const relayUrl = process.env.RELAY_URL;
+  if (relayUrl) {
+    try {
+      const res = await fetch(relayUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ to: toEmail, toName: toName || '', from: fromName || 'Fesh', subject, message: text, app: 'Fesh' }),
+        redirect: 'follow',
+      });
+      console.log(`Relay notification → ${toEmail} status=${res.status}`);
+    } catch (err) {
+      console.error('Relay notification failed:', err.message);
+    }
+    return;
+  }
+
+  const { SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM } = process.env;
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASS) return;
+  try {
+    const port = Number(SMTP_PORT || 587);
+    const transporter = nodemailer.createTransport({
+      host: SMTP_HOST, port, secure: port === 465, auth: { user: SMTP_USER, pass: SMTP_PASS },
+    });
+    const who = escapeHtml(fromName || 'Un étudiant');
+    await transporter.sendMail({
+      from: SMTP_FROM || `Fesh <${SMTP_USER}>`,
+      to: toEmail,
+      subject,
+      text: `${fromName || 'Un étudiant'} t'a écrit sur Fesh :\n\n${text}\n\n—\nOuvre l'application Fesh pour répondre.`,
+      html: `<p><strong>${who}</strong> t'a écrit sur <strong>Fesh</strong> :</p>
+             <blockquote style="border-left:3px solid #00A884;padding-left:12px;color:#333;">${escapeHtml(text)}</blockquote>
+             <p style="color:#666;font-size:13px;">Ouvre l'application Fesh pour répondre.</p>`,
+    });
+    console.log(`Email notification sent to ${toEmail}`);
+  } catch (err) {
+    console.error('Email notification failed:', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
+// MESSAGES (logique commune REST + Socket)
+// ─────────────────────────────────────────────
+async function createMessage({ conversation, sender, text }) {
+  const clean = String(text || '').trim();
+  if (!clean) throw httpError(400, 'Le message ne peut pas être vide.');
+  if (clean.length > 5000) throw httpError(400, 'Message trop long (5000 caractères max).');
+
+  const message = await Message.create({
+    conversationId: conversation._id,
+    senderId: sender._id,
+    type: 'text',
+    text: clean,
+  });
+
+  conversation.lastMessage = { text: message.text, senderId: sender._id, createdAt: message.createdAt };
+  await conversation.save();
+
+  const populated = await message.populate('senderId', 'displayName photoUrl');
+  // JSON "plat" : évite d'envoyer des ObjectId/Buffer bruts via socket.io
+  const payload = JSON.parse(JSON.stringify(populated));
+
+  const participantIds = conversation.participants.map((p) => p.toString());
+  for (const pid of participantIds) io.to(`user:${pid}`).emit('message:new', payload);
+
+  // E-mail aux participants hors ligne (anti-spam)
+  (async () => {
+    try {
+      const others = participantIds.filter((id) => id !== sender._id.toString() && shouldNotify(id, conversation._id.toString()));
+      if (!others.length) return;
+      const users = await User.find({ _id: { $in: others } }).select('email displayName');
+      for (const u of users) {
+        notifyRecipientByEmail({
+          toEmail: u.email, toName: u.displayName, fromName: sender.displayName,
+          text: clean, conversationTitle: conversation.type === 'group' ? conversation.title : '',
+        }).catch(() => {});
+      }
+    } catch (err) {
+      console.error('Notify error:', err.message);
+    }
+  })();
+
+  return payload;
+}
 
 // ─────────────────────────────────────────────
 // ROUTES — AUTH
 // ─────────────────────────────────────────────
-app.post('/api/auth/register', async (req, res, next) => {
+app.post('/api/auth/register', authLimiter, async (req, res, next) => {
   try {
     const { displayName, email, password, country = '', program = '' } = req.body;
     if (!displayName || !email || !password) {
       return res.status(400).json({ success: false, message: 'Nom, e-mail et mot de passe obligatoires.' });
     }
+    const normalizedEmail = String(email).trim().toLowerCase();
+    if (!EMAIL_RE.test(normalizedEmail)) {
+      return res.status(400).json({ success: false, message: 'Adresse e-mail invalide.' });
+    }
     if (String(password).length < 8) {
       return res.status(400).json({ success: false, message: 'Le mot de passe doit contenir au moins 8 caractères.' });
     }
-
-    const normalizedEmail = String(email).trim().toLowerCase();
-    const existing = await User.findOne({ email: normalizedEmail });
-    if (existing) {
+    if (await User.findOne({ email: normalizedEmail })) {
       return res.status(409).json({ success: false, message: 'Cette adresse e-mail est déjà utilisée.' });
     }
 
-    const passwordHash = await bcrypt.hash(password, 12);
+    const passwordHash = await bcrypt.hash(String(password), 12);
     const user = await User.create({
-      displayName, email: normalizedEmail, passwordHash, country, program,
+      displayName: String(displayName).trim(), email: normalizedEmail, passwordHash,
+      country: String(country).trim(), program: String(program).trim(),
     });
 
     return res.status(201).json({
-      success: true,
-      message: 'Compte créé.',
+      success: true, message: 'Compte créé.',
       data: { user: publicUser(user), token: createToken(user._id) },
     });
   } catch (error) {
@@ -242,22 +298,18 @@ app.post('/api/auth/register', async (req, res, next) => {
   }
 });
 
-app.post('/api/auth/login', async (req, res, next) => {
+app.post('/api/auth/login', authLimiter, async (req, res, next) => {
   try {
     const { email, password } = req.body;
     if (!email || !password) {
       return res.status(400).json({ success: false, message: 'E-mail et mot de passe obligatoires.' });
     }
-
-    const user = await User.findOne({ email: String(email).trim().toLowerCase() })
-      .select('+passwordHash');
-    if (!user || !(await bcrypt.compare(password, user.passwordHash))) {
+    const user = await User.findOne({ email: String(email).trim().toLowerCase() }).select('+passwordHash');
+    if (!user || !(await bcrypt.compare(String(password), user.passwordHash))) {
       return res.status(401).json({ success: false, message: 'Identifiants incorrects.' });
     }
-
     return res.json({
-      success: true,
-      message: 'Connexion réussie.',
+      success: true, message: 'Connexion réussie.',
       data: { user: publicUser(user), token: createToken(user._id) },
     });
   } catch (error) {
@@ -265,20 +317,86 @@ app.post('/api/auth/login', async (req, res, next) => {
   }
 });
 
-app.get('/api/auth/me', authenticate, async (req, res) => {
+app.get('/api/auth/me', authenticate, (req, res) => {
   res.json({ success: true, data: { user: publicUser(req.user) } });
+});
+
+app.patch('/api/auth/me', authenticate, async (req, res, next) => {
+  try {
+    const { displayName, country, program } = req.body;
+    if (displayName !== undefined) {
+      const name = String(displayName).trim();
+      if (name.length < 2) return res.status(400).json({ success: false, message: 'Nom trop court.' });
+      req.user.displayName = name.slice(0, 80);
+    }
+    if (country !== undefined) req.user.country = String(country).trim().slice(0, 80);
+    if (program !== undefined) req.user.program = String(program).trim().slice(0, 120);
+    await req.user.save();
+    res.json({ success: true, data: { user: publicUser(req.user) } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─────────────────────────────────────────────
+// ROUTES — ANNUAIRE
+// ─────────────────────────────────────────────
+app.get('/api/users', authenticate, async (req, res, next) => {
+  try {
+    const q = String(req.query.q || '').trim().slice(0, 60);
+    const filter = { _id: { $ne: req.user._id } };
+    if (q) {
+      const rx = new RegExp(escapeRegex(q), 'i');
+      // L'e-mail n'est jamais renvoyé, mais une correspondance exacte permet de retrouver un ami.
+      filter.$or = [{ displayName: rx }, { country: rx }, { program: rx }, { email: q.toLowerCase() }];
+    }
+    const users = await User.find(filter).select('displayName country program photoUrl').sort({ displayName: 1 }).limit(40);
+    res.json({
+      success: true,
+      data: { users: users.map((u) => ({ id: u._id, displayName: u.displayName, country: u.country, program: u.program, photoUrl: u.photoUrl })) },
+    });
+  } catch (error) {
+    next(error);
+  }
 });
 
 // ─────────────────────────────────────────────
 // ROUTES — CHATS
 // ─────────────────────────────────────────────
+const POPULATE_FIELDS = 'displayName photoUrl country program';
+
 app.get('/api/chats', authenticate, async (req, res, next) => {
   try {
     const conversations = await Conversation.find({ participants: req.user._id })
-      .populate('participants', 'displayName email photoUrl country')
+      .populate('participants', POPULATE_FIELDS)
       .sort({ updatedAt: -1 })
-      .limit(100);
+      .limit(200);
     res.json({ success: true, data: { conversations } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/chats/private', authenticate, async (req, res, next) => {
+  try {
+    const { userId } = req.body;
+    if (!mongoose.isValidObjectId(userId) || String(userId) === req.user._id.toString()) {
+      return res.status(400).json({ success: false, message: 'Utilisateur invalide.' });
+    }
+    const other = await User.findById(userId).select('_id');
+    if (!other) return res.status(404).json({ success: false, message: 'Utilisateur introuvable.' });
+
+    let conversation = await Conversation.findOne({
+      type: 'private',
+      participants: { $all: [req.user._id, other._id], $size: 2 },
+    });
+    let created = false;
+    if (!conversation) {
+      conversation = await Conversation.create({ type: 'private', participants: [req.user._id, other._id], createdBy: req.user._id });
+      created = true;
+    }
+    const populated = await conversation.populate('participants', POPULATE_FIELDS);
+    res.status(created ? 201 : 200).json({ success: true, data: { conversation: populated } });
   } catch (error) {
     next(error);
   }
@@ -287,28 +405,24 @@ app.get('/api/chats', authenticate, async (req, res, next) => {
 app.post('/api/chats/group', authenticate, async (req, res, next) => {
   try {
     const { title, participantIds = [] } = req.body;
-    if (!title || !Array.isArray(participantIds)) {
+    if (!title || !String(title).trim() || !Array.isArray(participantIds)) {
       return res.status(400).json({ success: false, message: 'Nom du groupe et liste des membres requis.' });
     }
-
     const ids = [...new Set([req.user._id.toString(), ...participantIds.map(String)])];
     if (ids.some((id) => !mongoose.isValidObjectId(id))) {
       return res.status(400).json({ success: false, message: 'Identifiant de membre invalide.' });
     }
-
+    if (ids.length > 256) {
+      return res.status(400).json({ success: false, message: 'Trop de membres (256 max).' });
+    }
     const count = await User.countDocuments({ _id: { $in: ids } });
     if (count !== ids.length) {
       return res.status(400).json({ success: false, message: 'Un ou plusieurs membres sont introuvables.' });
     }
-
     const conversation = await Conversation.create({
-      type: 'group',
-      title: String(title).trim(),
-      participants: ids,
-      createdBy: req.user._id,
+      type: 'group', title: String(title).trim().slice(0, 80), participants: ids, createdBy: req.user._id,
     });
-
-    const populated = await conversation.populate('participants', 'displayName email photoUrl');
+    const populated = await conversation.populate('participants', POPULATE_FIELDS);
     res.status(201).json({ success: true, data: { conversation: populated } });
   } catch (error) {
     next(error);
@@ -317,19 +431,14 @@ app.post('/api/chats/group', authenticate, async (req, res, next) => {
 
 app.get('/api/chats/:chatId/messages', authenticate, async (req, res, next) => {
   try {
-    const conversation = await Conversation.findOne({
-      _id: req.params.chatId,
-      participants: req.user._id,
-    });
+    const conversation = await Conversation.findOne({ _id: req.params.chatId, participants: req.user._id });
     if (!conversation) {
       return res.status(404).json({ success: false, message: 'Conversation introuvable.' });
     }
-
     const messages = await Message.find({ conversationId: conversation._id })
       .populate('senderId', 'displayName photoUrl')
       .sort({ createdAt: -1 })
       .limit(100);
-
     res.json({ success: true, data: { messages: messages.reverse() } });
   } catch (error) {
     next(error);
@@ -338,59 +447,63 @@ app.get('/api/chats/:chatId/messages', authenticate, async (req, res, next) => {
 
 app.post('/api/chats/:chatId/messages', authenticate, async (req, res, next) => {
   try {
-    const { text } = req.body;
-    if (!text || !String(text).trim()) {
-      return res.status(400).json({ success: false, message: 'Le message ne peut pas être vide.' });
-    }
-
-    const conversation = await Conversation.findOne({
-      _id: req.params.chatId,
-      participants: req.user._id,
-    });
+    const conversation = await Conversation.findOne({ _id: req.params.chatId, participants: req.user._id });
     if (!conversation) {
       return res.status(404).json({ success: false, message: 'Conversation introuvable.' });
     }
+    const message = await createMessage({ conversation, sender: req.user, text: req.body.text });
+    res.status(201).json({ success: true, data: { message } });
+  } catch (error) {
+    next(error);
+  }
+});
 
-    const message = await Message.create({
-      conversationId: conversation._id,
-      senderId: req.user._id,
-      text: String(text).trim(),
-      type: 'text',
+// ─────────────────────────────────────────────
+// ROUTES — COMMUNAUTÉS
+// ─────────────────────────────────────────────
+app.get('/api/communities', authenticate, async (req, res, next) => {
+  try {
+    const list = await Conversation.find({ isPublic: true }).select('title description slug participants').sort({ createdAt: 1 });
+    res.json({
+      success: true,
+      data: {
+        communities: list.map((c) => ({
+          id: c._id, slug: c.slug, title: c.title, description: c.description,
+          memberCount: c.participants.length,
+          joined: c.participants.some((p) => p.equals(req.user._id)),
+        })),
+      },
     });
+  } catch (error) {
+    next(error);
+  }
+});
 
-    conversation.lastMessage = {
-      text: message.text,
-      senderId: req.user._id,
-      createdAt: message.createdAt,
-    };
-    await conversation.save();
-
-    const populated = await message.populate('senderId', 'displayName photoUrl');
-    req.app.get('io').to(conversation._id.toString()).emit('message:new', populated);
-
-    // Notifier les autres participants par e-mail (boîte de messagerie réelle)
-    try {
-      const others = await User.find({
-        _id: { $in: conversation.participants, $ne: req.user._id },
-      }).select('email displayName');
-      const fromName = req.user.displayName || 'Un étudiant';
-      const title = conversation.title || '';
-      for (const other of others) {
-        if (other.email) {
-          notifyRecipientByEmail({
-            toEmail: other.email,
-            toName: other.displayName,
-            fromName,
-            text: message.text,
-            conversationTitle: title,
-          }).catch(() => {});
-        }
-      }
-    } catch (notifyErr) {
-      console.error('Notify error:', notifyErr.message);
+app.post('/api/communities/:id/join', authenticate, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'Identifiant invalide.' });
     }
+    const conversation = await Conversation.findOneAndUpdate(
+      { _id: req.params.id, isPublic: true },
+      { $addToSet: { participants: req.user._id } },
+      { new: true },
+    );
+    if (!conversation) return res.status(404).json({ success: false, message: 'Communauté introuvable.' });
+    const populated = await conversation.populate('participants', POPULATE_FIELDS);
+    res.json({ success: true, data: { conversation: populated } });
+  } catch (error) {
+    next(error);
+  }
+});
 
-    res.status(201).json({ success: true, data: { message: populated } });
+app.post('/api/communities/:id/leave', authenticate, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(400).json({ success: false, message: 'Identifiant invalide.' });
+    }
+    await Conversation.updateOne({ _id: req.params.id, isPublic: true }, { $pull: { participants: req.user._id } });
+    res.json({ success: true });
   } catch (error) {
     next(error);
   }
@@ -399,28 +512,26 @@ app.post('/api/chats/:chatId/messages', authenticate, async (req, res, next) => 
 // ─────────────────────────────────────────────
 // HEALTH + ERRORS
 // ─────────────────────────────────────────────
-app.get('/', (_req, res) => {
-  res.json({ success: true, name: 'Fesh API', health: '/health' });
-});
-
-app.get('/health', (_req, res) => {
-  res.json({ success: true, status: 'ok', service: 'fesh-backend' });
-});
+app.get('/', (_req, res) => res.json({ success: true, name: 'Fesh API', health: '/health' }));
+app.get('/health', (_req, res) => res.json({ success: true, status: 'ok', service: 'fesh-backend' }));
 
 app.use((req, res) => {
   res.status(404).json({ success: false, message: `Route introuvable: ${req.method} ${req.originalUrl}` });
 });
 
 app.use((err, _req, res, _next) => {
-  console.error(err);
-  res.status(err.status || 500).json({
+  let status = err.status || 500;
+  if (err.name === 'CastError') status = 400;
+  if (status >= 500) console.error(err);
+  const hide = status >= 500 && process.env.NODE_ENV === 'production';
+  res.status(status).json({
     success: false,
-    message: err.message || 'Erreur interne du serveur.',
+    message: hide ? 'Erreur interne du serveur.' : (err.message || 'Erreur interne du serveur.'),
   });
 });
 
 // ─────────────────────────────────────────────
-// SOCKET.IO HANDLERS
+// SOCKET.IO
 // ─────────────────────────────────────────────
 io.use(async (socket, next) => {
   try {
@@ -437,70 +548,17 @@ io.use(async (socket, next) => {
 });
 
 io.on('connection', (socket) => {
-  socket.on('join_chat', async ({ chatId } = {}, callback = () => {}) => {
-    try {
-      const conversation = await Conversation.findOne({
-        _id: chatId,
-        participants: socket.user._id,
-      }).select('_id');
-      if (!conversation) return callback({ success: false, message: 'Accès refusé.' });
-      socket.join(conversation._id.toString());
-      callback({ success: true });
-    } catch (_error) {
-      callback({ success: false, message: 'Identifiant de conversation invalide.' });
-    }
-  });
+  // Chaque utilisateur reçoit TOUS ses messages (liste de discussions en temps réel)
+  socket.join(`user:${socket.user._id}`);
 
   socket.on('message:send', async ({ chatId, text } = {}, callback = () => {}) => {
     try {
-      if (!text || !String(text).trim()) {
-        return callback({ success: false, message: 'Message vide.' });
-      }
-      const conversation = await Conversation.findOne({
-        _id: chatId,
-        participants: socket.user._id,
-      });
+      const conversation = await Conversation.findOne({ _id: chatId, participants: socket.user._id });
       if (!conversation) return callback({ success: false, message: 'Accès refusé.' });
-
-      const message = await Message.create({
-        conversationId: conversation._id,
-        senderId: socket.user._id,
-        type: 'text',
-        text: String(text).trim(),
-      });
-
-      conversation.lastMessage = {
-        text: message.text,
-        senderId: socket.user._id,
-        createdAt: message.createdAt,
-      };
-      await conversation.save();
-
-      const populated = await message.populate('senderId', 'displayName photoUrl');
-      io.to(conversation._id.toString()).emit('message:new', populated);
-
-      // E-mail aux autres participants
-      try {
-        const others = await User.find({
-          _id: { $in: conversation.participants, $ne: socket.user._id },
-        }).select('email displayName');
-        const fromName = socket.user.displayName || 'Un étudiant';
-        for (const other of others) {
-          if (other.email) {
-            notifyRecipientByEmail({
-              toEmail: other.email,
-              toName: other.displayName,
-              fromName,
-              text: message.text,
-              conversationTitle: conversation.title || '',
-            }).catch(() => {});
-          }
-        }
-      } catch (_) {}
-
-      callback({ success: true, data: populated });
-    } catch (_error) {
-      callback({ success: false, message: 'Impossible d’envoyer le message.' });
+      const payload = await createMessage({ conversation, sender: socket.user, text });
+      callback({ success: true, data: payload });
+    } catch (error) {
+      callback({ success: false, message: error.status ? error.message : 'Impossible d’envoyer le message.' });
     }
   });
 });
@@ -508,15 +566,33 @@ io.on('connection', (socket) => {
 // ─────────────────────────────────────────────
 // START
 // ─────────────────────────────────────────────
+async function connectDatabase() {
+  const uri = process.env.MONGODB_URI;
+  if (!uri) throw new Error('La variable MONGODB_URI est absente.');
+  if (!process.env.JWT_SECRET) throw new Error('La variable JWT_SECRET est absente.');
+  mongoose.set('strictQuery', true);
+  await mongoose.connect(uri, { serverSelectionTimeoutMS: 15000 });
+  console.log(`MongoDB connected: ${mongoose.connection.name}`);
+}
+
+async function seedCommunities() {
+  for (const c of DEFAULT_COMMUNITIES) {
+    await Conversation.updateOne(
+      { slug: c.slug },
+      { $setOnInsert: { type: 'group', title: c.title, description: c.description, isPublic: true, participants: [] } },
+      { upsert: true },
+    );
+  }
+}
+
 const PORT = process.env.PORT || 5000;
 
 connectDatabase()
+  .then(seedCommunities)
   .then(() => {
-    server.listen(PORT, '0.0.0.0', () => {
-      console.log(`Fesh API running on port ${PORT}`);
-    });
+    server.listen(PORT, '0.0.0.0', () => console.log(`Fesh API running on port ${PORT}`));
   })
   .catch((error) => {
-    console.error('Impossible de démarrer sans MongoDB :', error.message);
+    console.error('Impossible de démarrer :', error.message);
     process.exit(1);
   });
