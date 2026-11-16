@@ -1,6 +1,8 @@
 require('dotenv').config();
 
 const http = require('http');
+const path = require('path');
+const fs = require('fs');
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -11,6 +13,7 @@ const jwt = require('jsonwebtoken');
 const mongoose = require('mongoose');
 const { Server } = require('socket.io');
 const nodemailer = require('nodemailer');
+const multer = require('multer');
 
 // ─────────────────────────────────────────────
 // MODELS
@@ -22,6 +25,10 @@ const userSchema = new mongoose.Schema({
   country: { type: String, trim: true, maxlength: 80, default: '' },
   program: { type: String, trim: true, maxlength: 120, default: '' },
   photoUrl: { type: String, default: '' },
+  statusText: { type: String, trim: true, maxlength: 140, default: '' },
+  statusMediaUrl: { type: String, default: '' },
+  statusType: { type: String, enum: ['', 'text', 'image', 'video'], default: '' },
+  statusAt: { type: Date },
 }, { timestamps: true });
 
 const conversationSchema = new mongoose.Schema({
@@ -44,14 +51,27 @@ conversationSchema.index({ participants: 1, updatedAt: -1 });
 const messageSchema = new mongoose.Schema({
   conversationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', required: true, index: true },
   senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  type: { type: String, enum: ['text'], default: 'text' },
-  text: { type: String, required: true, trim: true, maxlength: 5000 },
+  type: { type: String, enum: ['text', 'image', 'audio', 'file'], default: 'text' },
+  text: { type: String, trim: true, maxlength: 5000, default: '' },
+  mediaUrl: { type: String, default: '' },
+  fileName: { type: String, default: '' },
+  mimeType: { type: String, default: '' },
+  durationMs: { type: Number, default: 0 },
 }, { timestamps: true });
 messageSchema.index({ conversationId: 1, createdAt: -1 });
+
+const mediaSchema = new mongoose.Schema({
+  data: { type: Buffer, required: true, select: false },
+  fileName: { type: String, default: '' },
+  mimeType: { type: String, default: 'application/octet-stream' },
+  size: { type: Number, default: 0 },
+  uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+}, { timestamps: true });
 
 const User = mongoose.model('User', userSchema);
 const Conversation = mongoose.model('Conversation', conversationSchema);
 const Message = mongoose.model('Message', messageSchema);
+const Media = mongoose.model('Media', mediaSchema);
 
 const DEFAULT_COMMUNITIES = [
   { slug: 'international', title: 'Étudiants internationaux', description: 'Accueil et partage d’expériences' },
@@ -93,7 +113,11 @@ function publicUser(user) {
     email: user.email,
     country: user.country,
     program: user.program,
-    photoUrl: user.photoUrl,
+    photoUrl: user.photoUrl || '',
+    statusText: user.statusText || '',
+    statusMediaUrl: user.statusMediaUrl || '',
+    statusType: user.statusType || '',
+    statusAt: user.statusAt || null,
   };
 }
 
@@ -105,7 +129,7 @@ async function authenticate(req, res, next) {
       return res.status(401).json({ success: false, message: 'Authentification requise.' });
     }
     const payload = jwt.verify(token, process.env.JWT_SECRET);
-    const user = await User.findById(payload.sub).select('_id displayName email country program photoUrl');
+    const user = await User.findById(payload.sub).select('_id displayName email country program photoUrl statusText statusMediaUrl statusType statusAt');
     if (!user) {
       return res.status(401).json({ success: false, message: 'Compte introuvable.' });
     }
@@ -125,7 +149,7 @@ app.set('trust proxy', 1); // Render / reverse proxy
 
 const allowedOrigins = (process.env.CORS_ORIGIN || '*').split(',').map((o) => o.trim());
 
-app.use(helmet());
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
 app.use(cors({
   origin: (origin, callback) => {
     if (!origin || allowedOrigins.includes('*') || allowedOrigins.includes(origin)) {
@@ -134,7 +158,18 @@ app.use(cors({
     return callback(new Error('Origine non autorisée par CORS.'));
   },
 }));
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' }));
+
+// Médias stockés dans MongoDB (pas de disque éphémère Render)
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 12 * 1024 * 1024 }, // 12 MB (limite document MongoDB = 16 MB)
+  fileFilter: (_req, file, cb) => {
+    const ok = /^(image|audio|video|application)\//.test(file.mimetype) || file.mimetype === 'text/plain';
+    cb(ok ? null : new Error('Type de fichier non autorisé.'), ok);
+  },
+});
+
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'combined' : 'dev'));
 
 const io = new Server(server, {
@@ -218,19 +253,30 @@ async function notifyRecipientByEmail({ toEmail, toName, fromName, text, convers
 // ─────────────────────────────────────────────
 // MESSAGES (logique commune REST + Socket)
 // ─────────────────────────────────────────────
-async function createMessage({ conversation, sender, text }) {
+async function createMessage({ conversation, sender, text, type = 'text', mediaUrl = '', fileName = '', mimeType = '', durationMs = 0 }) {
   const clean = String(text || '').trim();
-  if (!clean) throw httpError(400, 'Le message ne peut pas être vide.');
+  const msgType = ['text', 'image', 'audio', 'file'].includes(type) ? type : 'text';
+  if (msgType === 'text') {
+    if (!clean) throw httpError(400, 'Le message ne peut pas être vide.');
+  } else if (!mediaUrl) {
+    throw httpError(400, 'Média manquant.');
+  }
   if (clean.length > 5000) throw httpError(400, 'Message trop long (5000 caractères max).');
+
+  const preview = msgType === 'image' ? '📷 Photo' : msgType === 'audio' ? '🎤 Message vocal' : msgType === 'file' ? `📎 ${fileName || 'Fichier'}` : clean;
 
   const message = await Message.create({
     conversationId: conversation._id,
     senderId: sender._id,
-    type: 'text',
+    type: msgType,
     text: clean,
+    mediaUrl,
+    fileName,
+    mimeType,
+    durationMs: Number(durationMs) || 0,
   });
 
-  conversation.lastMessage = { text: message.text, senderId: sender._id, createdAt: message.createdAt };
+  conversation.lastMessage = { text: preview, senderId: sender._id, createdAt: message.createdAt };
   await conversation.save();
 
   const populated = await message.populate('senderId', 'displayName photoUrl');
@@ -323,7 +369,7 @@ app.get('/api/auth/me', authenticate, (req, res) => {
 
 app.patch('/api/auth/me', authenticate, async (req, res, next) => {
   try {
-    const { displayName, country, program } = req.body;
+    const { displayName, country, program, photoUrl, statusText, statusMediaUrl, statusType, clearStatus } = req.body;
     if (displayName !== undefined) {
       const name = String(displayName).trim();
       if (name.length < 2) return res.status(400).json({ success: false, message: 'Nom trop court.' });
@@ -331,6 +377,22 @@ app.patch('/api/auth/me', authenticate, async (req, res, next) => {
     }
     if (country !== undefined) req.user.country = String(country).trim().slice(0, 80);
     if (program !== undefined) req.user.program = String(program).trim().slice(0, 120);
+    if (photoUrl !== undefined) req.user.photoUrl = String(photoUrl).trim().slice(0, 500);
+    if (clearStatus) {
+      req.user.statusText = '';
+      req.user.statusMediaUrl = '';
+      req.user.statusType = '';
+      req.user.statusAt = undefined;
+    } else {
+      if (statusText !== undefined) req.user.statusText = String(statusText).trim().slice(0, 140);
+      if (statusMediaUrl !== undefined) req.user.statusMediaUrl = String(statusMediaUrl).trim().slice(0, 500);
+      if (statusType !== undefined && ['', 'text', 'image', 'video'].includes(statusType)) {
+        req.user.statusType = statusType;
+      }
+      if (statusText !== undefined || statusMediaUrl !== undefined || statusType !== undefined) {
+        req.user.statusAt = new Date();
+      }
+    }
     await req.user.save();
     res.json({ success: true, data: { user: publicUser(req.user) } });
   } catch (error) {
@@ -445,13 +507,69 @@ app.get('/api/chats/:chatId/messages', authenticate, async (req, res, next) => {
   }
 });
 
+app.post('/api/upload', authenticate, upload.single('file'), async (req, res, next) => {
+  try {
+    if (!req.file) return res.status(400).json({ success: false, message: 'Aucun fichier reçu.' });
+    const doc = await Media.create({
+      data: req.file.buffer,
+      fileName: req.file.originalname || 'file',
+      mimeType: req.file.mimetype || 'application/octet-stream',
+      size: req.file.size,
+      uploadedBy: req.user._id,
+    });
+    const url = `/api/media/${doc._id}`;
+    res.status(201).json({
+      success: true,
+      data: {
+        url,
+        fileName: doc.fileName,
+        mimeType: doc.mimeType,
+        size: doc.size,
+      },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get('/api/media/:id', async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+      return res.status(404).json({ success: false, message: 'Média introuvable.' });
+    }
+    const doc = await Media.findById(req.params.id).select('+data');
+    if (!doc || !doc.data) {
+      return res.status(404).json({ success: false, message: 'Média introuvable.' });
+    }
+    res.set({
+      'Content-Type': doc.mimeType || 'application/octet-stream',
+      'Content-Length': doc.size || doc.data.length,
+      'Cache-Control': 'public, max-age=31536000, immutable',
+      'Content-Disposition': `inline; filename="${encodeURIComponent(doc.fileName || 'file')}"`,
+    });
+    res.send(doc.data);
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post('/api/chats/:chatId/messages', authenticate, async (req, res, next) => {
   try {
     const conversation = await Conversation.findOne({ _id: req.params.chatId, participants: req.user._id });
     if (!conversation) {
       return res.status(404).json({ success: false, message: 'Conversation introuvable.' });
     }
-    const message = await createMessage({ conversation, sender: req.user, text: req.body.text });
+    const { text, type, mediaUrl, fileName, mimeType, durationMs } = req.body || {};
+    const message = await createMessage({
+      conversation,
+      sender: req.user,
+      text,
+      type,
+      mediaUrl,
+      fileName,
+      mimeType,
+      durationMs,
+    });
     res.status(201).json({ success: true, data: { message } });
   } catch (error) {
     next(error);
@@ -551,15 +669,67 @@ io.on('connection', (socket) => {
   // Chaque utilisateur reçoit TOUS ses messages (liste de discussions en temps réel)
   socket.join(`user:${socket.user._id}`);
 
-  socket.on('message:send', async ({ chatId, text } = {}, callback = () => {}) => {
+  socket.on('message:send', async (data = {}, callback = () => {}) => {
     try {
+      const { chatId, text, type, mediaUrl, fileName, mimeType, durationMs } = data;
       const conversation = await Conversation.findOne({ _id: chatId, participants: socket.user._id });
       if (!conversation) return callback({ success: false, message: 'Accès refusé.' });
-      const payload = await createMessage({ conversation, sender: socket.user, text });
+      const payload = await createMessage({
+        conversation,
+        sender: socket.user,
+        text,
+        type,
+        mediaUrl,
+        fileName,
+        mimeType,
+        durationMs,
+      });
       callback({ success: true, data: payload });
     } catch (error) {
       callback({ success: false, message: error.status ? error.message : 'Impossible d’envoyer le message.' });
     }
+  });
+
+  // ── WebRTC signaling (1-1 calls) ─────────────────────────
+  socket.on('call:invite', ({ toUserId, chatId, callType, offer } = {}) => {
+    if (!toUserId) return;
+    io.to(`user:${toUserId}`).emit('call:invite', {
+      fromUserId: String(socket.user._id),
+      fromName: socket.user.displayName,
+      chatId,
+      callType: callType === 'video' ? 'video' : 'audio',
+      offer,
+    });
+  });
+
+  socket.on('call:answer', ({ toUserId, answer } = {}) => {
+    if (!toUserId) return;
+    io.to(`user:${toUserId}`).emit('call:answer', {
+      fromUserId: String(socket.user._id),
+      answer,
+    });
+  });
+
+  socket.on('call:ice', ({ toUserId, candidate } = {}) => {
+    if (!toUserId || !candidate) return;
+    io.to(`user:${toUserId}`).emit('call:ice', {
+      fromUserId: String(socket.user._id),
+      candidate,
+    });
+  });
+
+  socket.on('call:hangup', ({ toUserId } = {}) => {
+    if (!toUserId) return;
+    io.to(`user:${toUserId}`).emit('call:hangup', {
+      fromUserId: String(socket.user._id),
+    });
+  });
+
+  socket.on('call:reject', ({ toUserId } = {}) => {
+    if (!toUserId) return;
+    io.to(`user:${toUserId}`).emit('call:reject', {
+      fromUserId: String(socket.user._id),
+    });
   });
 });
 
