@@ -42,6 +42,8 @@ const conversationSchema = new mongoose.Schema({
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   lastMessage: {
     text: { type: String, default: '' },
+    type: { type: String, default: 'text' },
+    durationMs: { type: Number, default: 0 },
     senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
     createdAt: { type: Date },
   },
@@ -51,14 +53,45 @@ conversationSchema.index({ participants: 1, updatedAt: -1 });
 const messageSchema = new mongoose.Schema({
   conversationId: { type: mongoose.Schema.Types.ObjectId, ref: 'Conversation', required: true, index: true },
   senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  type: { type: String, enum: ['text', 'image', 'audio', 'file'], default: 'text' },
+  type: { type: String, enum: ['text', 'image', 'audio', 'file', 'location'], default: 'text' },
   text: { type: String, trim: true, maxlength: 5000, default: '' },
   mediaUrl: { type: String, default: '' },
   fileName: { type: String, default: '' },
   mimeType: { type: String, default: '' },
   durationMs: { type: Number, default: 0 },
+  lat: { type: Number },
+  lng: { type: Number },
+  forwarded: { type: Boolean, default: false },
+  // Aperçu du message cité (réponse)
+  reply: {
+    type: new mongoose.Schema({
+      id: String, senderId: String, senderName: String, kind: String, text: String,
+    }, { _id: false }),
+    default: undefined,
+  },
+  reactions: {
+    type: [new mongoose.Schema({
+      userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+      emoji: { type: String, maxlength: 16 },
+    }, { _id: false })],
+    default: [],
+  },
+  deleted: { type: Boolean, default: false },
+  deletedFor: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
 }, { timestamps: true });
 messageSchema.index({ conversationId: 1, createdAt: -1 });
+
+// Statuts éphémères (24 h)
+const statusSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true, index: true },
+  type: { type: String, enum: ['text', 'image', 'video'], required: true },
+  text: { type: String, trim: true, maxlength: 200, default: '' },
+  mediaUrl: { type: String, default: '' },
+  bg: { type: String, default: '0' },
+  expiresAt: { type: Date, required: true },
+  viewers: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+}, { timestamps: true });
+statusSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 
 const mediaSchema = new mongoose.Schema({
   data: { type: Buffer, required: true, select: false },
@@ -72,6 +105,7 @@ const User = mongoose.model('User', userSchema);
 const Conversation = mongoose.model('Conversation', conversationSchema);
 const Message = mongoose.model('Message', messageSchema);
 const Media = mongoose.model('Media', mediaSchema);
+const Status = mongoose.model('Status', statusSchema);
 
 const DEFAULT_COMMUNITIES = [
   { slug: 'international', title: 'Étudiants internationaux', description: 'Accueil et partage d’expériences' },
@@ -253,17 +287,38 @@ async function notifyRecipientByEmail({ toEmail, toName, fromName, text, convers
 // ─────────────────────────────────────────────
 // MESSAGES (logique commune REST + Socket)
 // ─────────────────────────────────────────────
-async function createMessage({ conversation, sender, text, type = 'text', mediaUrl = '', fileName = '', mimeType = '', durationMs = 0 }) {
+async function createMessage({ conversation, sender, text, type = 'text', mediaUrl = '', fileName = '', mimeType = '', durationMs = 0, lat, lng, forwarded = false, replyTo }) {
   const clean = String(text || '').trim();
-  const msgType = ['text', 'image', 'audio', 'file'].includes(type) ? type : 'text';
+  const msgType = ['text', 'image', 'audio', 'file', 'location'].includes(type) ? type : 'text';
+  const latN = Number(lat);
+  const lngN = Number(lng);
   if (msgType === 'text') {
     if (!clean) throw httpError(400, 'Le message ne peut pas être vide.');
+  } else if (msgType === 'location') {
+    if (!Number.isFinite(latN) || !Number.isFinite(lngN) || Math.abs(latN) > 90 || Math.abs(lngN) > 180) {
+      throw httpError(400, 'Position invalide.');
+    }
   } else if (!mediaUrl) {
     throw httpError(400, 'Média manquant.');
   }
   if (clean.length > 5000) throw httpError(400, 'Message trop long (5000 caractères max).');
 
-  const preview = msgType === 'image' ? '📷 Photo' : msgType === 'audio' ? '🎤 Message vocal' : msgType === 'file' ? `📎 ${fileName || 'Fichier'}` : clean;
+  const preview = msgType === 'image' ? '📷 Photo' : msgType === 'audio' ? '🎤 Message vocal' : msgType === 'file' ? `📎 ${fileName || 'Fichier'}` : msgType === 'location' ? '📍 Position' : clean;
+
+  // Message cité
+  let reply;
+  if (replyTo && mongoose.isValidObjectId(replyTo)) {
+    const quoted = await Message.findOne({ _id: replyTo, conversationId: conversation._id }).populate('senderId', 'displayName');
+    if (quoted && !quoted.deleted) {
+      reply = {
+        id: quoted._id.toString(),
+        senderId: quoted.senderId && quoted.senderId._id ? quoted.senderId._id.toString() : '',
+        senderName: quoted.senderId && quoted.senderId.displayName ? quoted.senderId.displayName : '',
+        kind: quoted.type,
+        text: quoted.type === 'text' ? quoted.text.slice(0, 200) : (quoted.type === 'file' ? quoted.fileName : ''),
+      };
+    }
+  }
 
   const message = await Message.create({
     conversationId: conversation._id,
@@ -274,9 +329,13 @@ async function createMessage({ conversation, sender, text, type = 'text', mediaU
     fileName,
     mimeType,
     durationMs: Number(durationMs) || 0,
+    lat: msgType === 'location' ? latN : undefined,
+    lng: msgType === 'location' ? lngN : undefined,
+    forwarded: !!forwarded,
+    reply,
   });
 
-  conversation.lastMessage = { text: preview, senderId: sender._id, createdAt: message.createdAt };
+  conversation.lastMessage = { text: preview, type: msgType, durationMs: Number(durationMs) || 0, senderId: sender._id, createdAt: message.createdAt };
   await conversation.save();
 
   const populated = await message.populate('senderId', 'displayName photoUrl');
@@ -497,7 +556,7 @@ app.get('/api/chats/:chatId/messages', authenticate, async (req, res, next) => {
     if (!conversation) {
       return res.status(404).json({ success: false, message: 'Conversation introuvable.' });
     }
-    const messages = await Message.find({ conversationId: conversation._id })
+    const messages = await Message.find({ conversationId: conversation._id, deletedFor: { $ne: req.user._id } })
       .populate('senderId', 'displayName photoUrl')
       .sort({ createdAt: -1 })
       .limit(100);
@@ -541,12 +600,27 @@ app.get('/api/media/:id', async (req, res, next) => {
     if (!doc || !doc.data) {
       return res.status(404).json({ success: false, message: 'Média introuvable.' });
     }
-    res.set({
+    const total = doc.data.length;
+    const base = {
       'Content-Type': doc.mimeType || 'application/octet-stream',
-      'Content-Length': doc.size || doc.data.length,
+      'Accept-Ranges': 'bytes',
       'Cache-Control': 'public, max-age=31536000, immutable',
       'Content-Disposition': `inline; filename="${encodeURIComponent(doc.fileName || 'file')}"`,
-    });
+    };
+    // Lecture partielle (nécessaire pour les vidéos / la barre de lecture des vocaux)
+    const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+    if (m && (m[1] !== '' || m[2] !== '')) {
+      let start = m[1] === '' ? Math.max(0, total - Number(m[2])) : Number(m[1]);
+      let end = m[1] === '' || m[2] === '' ? total - 1 : Math.min(Number(m[2]), total - 1);
+      if (start >= total || start > end) {
+        res.status(416).set({ 'Content-Range': `bytes */${total}` }).end();
+        return;
+      }
+      res.status(206).set({ ...base, 'Content-Range': `bytes ${start}-${end}/${total}`, 'Content-Length': end - start + 1 });
+      res.end(doc.data.subarray(start, end + 1));
+      return;
+    }
+    res.set({ ...base, 'Content-Length': total });
     res.send(doc.data);
   } catch (error) {
     next(error);
@@ -559,7 +633,7 @@ app.post('/api/chats/:chatId/messages', authenticate, async (req, res, next) => 
     if (!conversation) {
       return res.status(404).json({ success: false, message: 'Conversation introuvable.' });
     }
-    const { text, type, mediaUrl, fileName, mimeType, durationMs } = req.body || {};
+    const { text, type, mediaUrl, fileName, mimeType, durationMs, lat, lng, forwarded, replyTo } = req.body || {};
     const message = await createMessage({
       conversation,
       sender: req.user,
@@ -569,12 +643,189 @@ app.post('/api/chats/:chatId/messages', authenticate, async (req, res, next) => 
       fileName,
       mimeType,
       durationMs,
+      lat,
+      lng,
+      forwarded,
+      replyTo,
     });
     res.status(201).json({ success: true, data: { message } });
   } catch (error) {
     next(error);
   }
 });
+
+// ─────────────────────────────────────────────
+// ROUTES — ACTIONS SUR LES MESSAGES / GROUPES
+// ─────────────────────────────────────────────
+async function loadMessageForUser(messageId, userId) {
+  if (!mongoose.isValidObjectId(messageId)) throw httpError(400, 'Identifiant invalide.');
+  const message = await Message.findById(messageId);
+  if (!message) throw httpError(404, 'Message introuvable.');
+  const conversation = await Conversation.findOne({ _id: message.conversationId, participants: userId });
+  if (!conversation) throw httpError(403, 'Accès refusé.');
+  return { message, conversation };
+}
+
+async function broadcastMessageUpdate(message, conversation) {
+  const populated = await message.populate('senderId', 'displayName photoUrl');
+  const payload = JSON.parse(JSON.stringify(populated));
+  for (const pid of conversation.participants) io.to(`user:${pid}`).emit('message:update', payload);
+  return payload;
+}
+
+// Réaction (un seul emoji par personne ; renvoyer le même emoji l'enlève)
+app.put('/api/messages/:id/react', authenticate, async (req, res, next) => {
+  try {
+    const { message, conversation } = await loadMessageForUser(req.params.id, req.user._id);
+    if (message.deleted) throw httpError(400, 'Message supprimé.');
+    const emoji = String((req.body && req.body.emoji) || '').trim().slice(0, 16);
+    const me = req.user._id.toString();
+    const existing = message.reactions.find((r) => String(r.userId) === me);
+    message.reactions = message.reactions.filter((r) => String(r.userId) !== me);
+    if (emoji && !(existing && existing.emoji === emoji)) {
+      message.reactions.push({ userId: req.user._id, emoji });
+    }
+    await message.save();
+    const payload = await broadcastMessageUpdate(message, conversation);
+    res.json({ success: true, data: { message: payload } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Suppression : ?forAll=1 (auteur uniquement) ou pour moi seulement
+app.delete('/api/messages/:id', authenticate, async (req, res, next) => {
+  try {
+    const { message, conversation } = await loadMessageForUser(req.params.id, req.user._id);
+    const forAll = req.query.forAll === '1' || req.query.forAll === 'true';
+    if (forAll) {
+      if (String(message.senderId) !== req.user._id.toString()) throw httpError(403, 'Tu ne peux supprimer pour tous que tes propres messages.');
+      message.deleted = true;
+      message.text = '';
+      message.mediaUrl = '';
+      message.fileName = '';
+      message.reactions = [];
+      message.reply = undefined;
+      await message.save();
+      await broadcastMessageUpdate(message, conversation);
+    } else {
+      await Message.updateOne({ _id: message._id }, { $addToSet: { deletedFor: req.user._id } });
+    }
+    res.json({ success: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Quitter un groupe ou une communauté
+app.post('/api/chats/:chatId/leave', authenticate, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.chatId)) throw httpError(400, 'Identifiant invalide.');
+    const conversation = await Conversation.findOne({ _id: req.params.chatId, participants: req.user._id });
+    if (!conversation) throw httpError(404, 'Conversation introuvable.');
+    if (conversation.type !== 'group') throw httpError(400, 'Tu ne peux quitter qu’un groupe.');
+    await Conversation.updateOne({ _id: conversation._id }, { $pull: { participants: req.user._id } });
+    res.json({ success: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─────────────────────────────────────────────
+// ROUTES — STATUTS (24 h)
+// ─────────────────────────────────────────────
+// Audience = moi + toutes les personnes avec qui je partage une discussion.
+async function statusAudience(userId) {
+  const convs = await Conversation.find({ participants: userId }).select('participants').limit(500);
+  const ids = new Set([userId.toString()]);
+  for (const c of convs) for (const p of c.participants) ids.add(p.toString());
+  return [...ids];
+}
+
+function statusJson(st, me) {
+  const owner = st.userId && st.userId._id ? st.userId : null;
+  const ownerId = owner ? owner._id.toString() : String(st.userId);
+  const mine = ownerId === me.toString();
+  return {
+    id: st._id,
+    userId: ownerId,
+    displayName: owner ? owner.displayName : '',
+    photoUrl: owner ? owner.photoUrl || '' : '',
+    type: st.type,
+    text: st.text,
+    mediaUrl: st.mediaUrl,
+    bg: st.bg,
+    createdAt: st.createdAt,
+    expiresAt: st.expiresAt,
+    viewed: mine ? true : st.viewers.some((v) => v.toString() === me.toString()),
+    viewCount: mine ? st.viewers.length : 0,
+  };
+}
+
+app.get('/api/statuses', authenticate, async (req, res, next) => {
+  try {
+    const audience = await statusAudience(req.user._id);
+    const list = await Status.find({ userId: { $in: audience }, expiresAt: { $gt: new Date() } })
+      .populate('userId', 'displayName photoUrl')
+      .sort({ createdAt: 1 })
+      .limit(400);
+    res.json({ success: true, data: { statuses: list.map((st) => statusJson(st, req.user._id)) } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/statuses', authenticate, async (req, res, next) => {
+  try {
+    const { type, text = '', mediaUrl = '', bg = '0' } = req.body || {};
+    if (!['text', 'image', 'video'].includes(type)) throw httpError(400, 'Type de statut invalide.');
+    const cleanText = String(text).trim().slice(0, 200);
+    if (type === 'text' && !cleanText) throw httpError(400, 'Écris quelque chose pour ton statut.');
+    if (type !== 'text' && !mediaUrl) throw httpError(400, 'Média manquant.');
+    const st = await Status.create({
+      userId: req.user._id,
+      type,
+      text: cleanText,
+      mediaUrl: type === 'text' ? '' : String(mediaUrl).slice(0, 500),
+      bg: String(bg).slice(0, 12),
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000),
+    });
+    statusAudience(req.user._id)
+      .then((ids) => ids.forEach((id) => io.to(`user:${id}`).emit('status:changed', { userId: req.user._id.toString() })))
+      .catch(() => {});
+    res.status(201).json({ success: true, data: { status: { id: st._id } } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/statuses/:id/view', authenticate, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) throw httpError(400, 'Identifiant invalide.');
+    await Status.updateOne(
+      { _id: req.params.id, userId: { $ne: req.user._id } },
+      { $addToSet: { viewers: req.user._id } },
+    );
+    res.json({ success: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete('/api/statuses/:id', authenticate, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.id)) throw httpError(400, 'Identifiant invalide.');
+    const r = await Status.deleteOne({ _id: req.params.id, userId: req.user._id });
+    if (!r.deletedCount) throw httpError(404, 'Statut introuvable.');
+    statusAudience(req.user._id)
+      .then((ids) => ids.forEach((id) => io.to(`user:${id}`).emit('status:changed', { userId: req.user._id.toString() })))
+      .catch(() => {});
+    res.json({ success: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
 
 // ─────────────────────────────────────────────
 // ROUTES — COMMUNAUTÉS
@@ -640,6 +891,9 @@ app.use((req, res) => {
 app.use((err, _req, res, _next) => {
   let status = err.status || 500;
   if (err.name === 'CastError') status = 400;
+  if (err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ success: false, message: 'Fichier trop volumineux (12 Mo max).' });
+  }
   if (status >= 500) console.error(err);
   const hide = status >= 500 && process.env.NODE_ENV === 'production';
   res.status(status).json({
@@ -671,7 +925,7 @@ io.on('connection', (socket) => {
 
   socket.on('message:send', async (data = {}, callback = () => {}) => {
     try {
-      const { chatId, text, type, mediaUrl, fileName, mimeType, durationMs } = data;
+      const { chatId, text, type, mediaUrl, fileName, mimeType, durationMs, lat, lng, forwarded, replyTo } = data;
       const conversation = await Conversation.findOne({ _id: chatId, participants: socket.user._id });
       if (!conversation) return callback({ success: false, message: 'Accès refusé.' });
       const payload = await createMessage({
@@ -683,6 +937,10 @@ io.on('connection', (socket) => {
         fileName,
         mimeType,
         durationMs,
+        lat,
+        lng,
+        forwarded,
+        replyTo,
       });
       callback({ success: true, data: payload });
     } catch (error) {
