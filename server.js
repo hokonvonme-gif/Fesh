@@ -29,6 +29,16 @@ const userSchema = new mongoose.Schema({
   statusMediaUrl: { type: String, default: '' },
   statusType: { type: String, enum: ['', 'text', 'image', 'video'], default: '' },
   statusAt: { type: Date },
+  // Appareils pour les notifications push (FCM) + langue choisie dans l'app
+  fcmTokens: {
+    type: [new mongoose.Schema({
+      token: { type: String, required: true },
+      lang: { type: String, default: 'fr' },
+      updatedAt: { type: Date, default: Date.now },
+    }, { _id: false })],
+    default: [],
+    select: false,
+  },
 }, { timestamps: true });
 
 const conversationSchema = new mongoose.Schema({
@@ -38,6 +48,7 @@ const conversationSchema = new mongoose.Schema({
   // Communautés publiques (n'importe qui peut les rejoindre)
   isPublic: { type: Boolean, default: false },
   slug: { type: String, trim: true, index: true, sparse: true },
+  photoUrl: { type: String, default: '' },
   participants: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
   lastMessage: {
@@ -45,6 +56,7 @@ const conversationSchema = new mongoose.Schema({
     type: { type: String, default: 'text' },
     durationMs: { type: Number, default: 0 },
     senderId: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    messageId: { type: mongoose.Schema.Types.ObjectId },
     createdAt: { type: Date },
   },
 }, { timestamps: true });
@@ -78,6 +90,12 @@ const messageSchema = new mongoose.Schema({
   },
   deleted: { type: Boolean, default: false },
   deletedFor: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  // Coches : reçu / lu (par les destinataires)
+  deliveredTo: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  readBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  // Vue unique (photo / vidéo / vocal)
+  viewOnce: { type: Boolean, default: false },
+  viewedBy: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
 }, { timestamps: true });
 messageSchema.index({ conversationId: 1, createdAt: -1 });
 
@@ -99,6 +117,7 @@ const mediaSchema = new mongoose.Schema({
   mimeType: { type: String, default: 'application/octet-stream' },
   size: { type: Number, default: 0 },
   uploadedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  viewOnce: { type: Boolean, default: false },
 }, { timestamps: true });
 
 const User = mongoose.model('User', userSchema);
@@ -219,6 +238,116 @@ const authLimiter = rateLimit({
 });
 
 // ─────────────────────────────────────────────
+// NOTIFICATIONS PUSH (Firebase Cloud Messaging)
+// ─────────────────────────────────────────────
+let fcm = null;
+(function initFirebase() {
+  try {
+    let raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+    if (!raw && process.env.FIREBASE_SERVICE_ACCOUNT_B64) {
+      raw = Buffer.from(process.env.FIREBASE_SERVICE_ACCOUNT_B64, 'base64').toString('utf8');
+    }
+    if (!raw) {
+      console.log('Push FCM désactivé (FIREBASE_SERVICE_ACCOUNT absent).');
+      return;
+    }
+    const admin = require('firebase-admin');
+    const cred = JSON.parse(raw);
+    if (cred.private_key) cred.private_key = cred.private_key.replace(/\\n/g, '\n');
+    admin.initializeApp({ credential: admin.credential.cert(cred) });
+    fcm = admin.messaging();
+    console.log('Push FCM activé.');
+  } catch (err) {
+    console.error('Init Firebase impossible :', err.message);
+  }
+})();
+
+const LANGS = ['fr', 'en', 'es', 'pt', 'de', 'it'];
+const PUSH_TXT = {
+  fr: { voice: 'Message vocal', photo: 'Photo', file: 'Fichier', location: 'Position', once: 'Média à vue unique', msg: 'Nouveau message' },
+  en: { voice: 'Voice message', photo: 'Photo', file: 'File', location: 'Location', once: 'View-once media', msg: 'New message' },
+  es: { voice: 'Mensaje de voz', photo: 'Foto', file: 'Archivo', location: 'Ubicación', once: 'Contenido de una sola vez', msg: 'Mensaje nuevo' },
+  pt: { voice: 'Mensagem de voz', photo: 'Foto', file: 'Arquivo', location: 'Localização', once: 'Mídia de visualização única', msg: 'Nova mensagem' },
+  de: { voice: 'Sprachnachricht', photo: 'Foto', file: 'Datei', location: 'Standort', once: 'Einmal-Ansicht', msg: 'Neue Nachricht' },
+  it: { voice: 'Messaggio vocale', photo: 'Foto', file: 'File', location: 'Posizione', once: 'Visualizzazione singola', msg: 'Nuovo messaggio' },
+};
+const COMMUNITY_TITLES = {"international": {"fr": "Étudiants internationaux", "en": "International students", "es": "Estudiantes internacionales", "pt": "Estudantes internacionais", "de": "Internationale Studierende", "it": "Studenti internazionali"}, "arrival": {"fr": "Préparer son arrivée", "en": "Prepare your arrival", "es": "Preparar la llegada", "pt": "Preparar a chegada", "de": "Ankunft vorbereiten", "it": "Preparare l’arrivo"}, "housing": {"fr": "Logement à Accra", "en": "Housing in Accra", "es": "Alojamiento en Accra", "pt": "Moradia em Accra", "de": "Wohnen in Accra", "it": "Alloggio ad Accra"}, "admission": {"fr": "Admissions & visa", "en": "Admissions & visa", "es": "Admisiones y visa", "pt": "Admissões e visto", "de": "Zulassung & Visum", "it": "Ammissioni e visto"}, "daily-life": {"fr": "Vie à Accra", "en": "Life in Accra", "es": "Vida en Accra", "pt": "Vida em Accra", "de": "Leben in Accra", "it": "Vita ad Accra"}, "engineering": {"fr": "Génie électrique", "en": "Electrical engineering", "es": "Ingeniería eléctrica", "pt": "Engenharia elétrica", "de": "Elektrotechnik", "it": "Ingegneria elettrica"}};
+
+function pushBody(lang, msg) {
+  const t = PUSH_TXT[lang] || PUSH_TXT.fr;
+  if (msg.viewOnce) return `🔒 ${t.once}`;
+  switch (msg.type) {
+    case 'audio': return `🎤 ${t.voice}`;
+    case 'image': return `📷 ${msg.text ? msg.text : t.photo}`;
+    case 'file': return `📎 ${msg.fileName || t.file}`;
+    case 'location': return `📍 ${t.location}`;
+    default: return msg.text || t.msg;
+  }
+}
+
+async function sendPushForMessage({ conversation, sender, message }) {
+  if (!fcm) return;
+  const senderId = sender._id.toString();
+  const recipientIds = conversation.participants.map((p) => p.toString()).filter((id) => id !== senderId);
+  if (!recipientIds.length) return;
+  const users = await User.find({ _id: { $in: recipientIds } }).select('+fcmTokens');
+  const byLang = new Map(); // lang -> [token]
+  for (const u of users) {
+    for (const d of u.fcmTokens || []) {
+      const lang = LANGS.includes(d.lang) ? d.lang : 'fr';
+      if (!byLang.has(lang)) byLang.set(lang, []);
+      byLang.get(lang).push(d.token);
+    }
+  }
+  if (!byLang.size) return;
+  const isGroup = conversation.type === 'group';
+  const firstName = String(sender.displayName || '').split(' ')[0];
+  for (const [lang, tokens] of byLang) {
+    const body = pushBody(lang, message);
+    const groupTitle = conversation.slug && COMMUNITY_TITLES[conversation.slug]
+      ? (COMMUNITY_TITLES[conversation.slug][lang] || conversation.title)
+      : conversation.title;
+    const title = isGroup ? groupTitle : sender.displayName;
+    const text = (isGroup ? `${firstName}: ${body}` : body).slice(0, 160);
+    for (let i = 0; i < tokens.length; i += 500) {
+      const chunk = tokens.slice(i, i + 500);
+      try {
+        const res = await fcm.sendEachForMulticast({
+          tokens: chunk,
+          notification: { title, body: text },
+          data: { type: 'message', chatId: conversation._id.toString(), messageId: message._id.toString(), title, body: text },
+          android: {
+            priority: 'high',
+            notification: { channelId: 'fesh_messages', sound: 'default', defaultSound: true },
+          },
+          apns: { headers: { 'apns-priority': '10' }, payload: { aps: { sound: 'default' } } },
+        });
+        // nettoyage des appareils qui ne sont plus valides
+        const dead = [];
+        res.responses.forEach((r, idx) => {
+          const code = r.error && r.error.code;
+          if (code === 'messaging/registration-token-not-registered' || code === 'messaging/invalid-registration-token') dead.push(chunk[idx]);
+        });
+        if (dead.length) await User.updateMany({ 'fcmTokens.token': { $in: dead } }, { $pull: { fcmTokens: { token: { $in: dead } } } });
+      } catch (err) {
+        console.error('Push FCM erreur :', err.message);
+      }
+    }
+  }
+}
+
+// Sérialisation d'un message : pas d'URL pour les médias à vue unique
+function msgJson(doc) {
+  const j = JSON.parse(JSON.stringify(doc));
+  delete j.fcmTokens;
+  if (j.viewOnce) {
+    j.mediaUrl = '';
+    j.fileName = '';
+  }
+  return j;
+}
+
+// ─────────────────────────────────────────────
 // NOTIFICATIONS E-MAIL (seulement si hors ligne + anti-spam)
 // ─────────────────────────────────────────────
 const NOTIFY_COOLDOWN_MS = Number(process.env.NOTIFY_COOLDOWN_MIN || 10) * 60 * 1000;
@@ -287,7 +416,7 @@ async function notifyRecipientByEmail({ toEmail, toName, fromName, text, convers
 // ─────────────────────────────────────────────
 // MESSAGES (logique commune REST + Socket)
 // ─────────────────────────────────────────────
-async function createMessage({ conversation, sender, text, type = 'text', mediaUrl = '', fileName = '', mimeType = '', durationMs = 0, lat, lng, forwarded = false, replyTo }) {
+async function createMessage({ conversation, sender, text, type = 'text', mediaUrl = '', fileName = '', mimeType = '', durationMs = 0, lat, lng, forwarded = false, replyTo, viewOnce = false }) {
   const clean = String(text || '').trim();
   const msgType = ['text', 'image', 'audio', 'file', 'location'].includes(type) ? type : 'text';
   const latN = Number(lat);
@@ -333,17 +462,30 @@ async function createMessage({ conversation, sender, text, type = 'text', mediaU
     lng: msgType === 'location' ? lngN : undefined,
     forwarded: !!forwarded,
     reply,
+    viewOnce: !!viewOnce && (msgType === 'image' || msgType === 'audio' || (msgType === 'file' && /^video\//.test(String(mimeType || '')))),
   });
 
-  conversation.lastMessage = { text: preview, type: msgType, durationMs: Number(durationMs) || 0, senderId: sender._id, createdAt: message.createdAt };
+  // Le média d'un message à vue unique n'est plus accessible sans jeton
+  if (message.viewOnce) {
+    const mid = /\/api\/media\/([a-f0-9]{24})/i.exec(mediaUrl || '');
+    if (mid) await Media.updateOne({ _id: mid[1] }, { $set: { viewOnce: true } });
+  }
+
+  conversation.lastMessage = { text: message.viewOnce ? '🔒' : preview, type: msgType, durationMs: Number(durationMs) || 0, senderId: sender._id, messageId: message._id, createdAt: message.createdAt };
   await conversation.save();
 
   const populated = await message.populate('senderId', 'displayName photoUrl');
   // JSON "plat" : évite d'envoyer des ObjectId/Buffer bruts via socket.io
-  const payload = JSON.parse(JSON.stringify(populated));
+  const payload = msgJson(populated);
 
   const participantIds = conversation.participants.map((p) => p.toString());
   for (const pid of participantIds) io.to(`user:${pid}`).emit('message:new', payload);
+
+  // Coches « reçu » pour les destinataires connectés + notification push pour tous
+  for (const pid of participantIds) {
+    if (pid !== sender._id.toString() && isOnline(pid)) markDelivered(pid, [conversation._id.toString()]).catch(() => {});
+  }
+  sendPushForMessage({ conversation, sender, message: message.toObject() }).catch((err) => console.error('Push error:', err.message));
 
   // E-mail aux participants hors ligne (anti-spam)
   (async () => {
@@ -453,6 +595,13 @@ app.patch('/api/auth/me', authenticate, async (req, res, next) => {
       }
     }
     await req.user.save();
+    if (photoUrl !== undefined || displayName !== undefined) {
+      statusAudience(req.user._id)
+        .then((ids) => ids.forEach((id) => io.to(`user:${id}`).emit('user:updated', {
+          userId: req.user._id.toString(), displayName: req.user.displayName, photoUrl: req.user.photoUrl || '',
+        })))
+        .catch(() => {});
+    }
     res.json({ success: true, data: { user: publicUser(req.user) } });
   } catch (error) {
     next(error);
@@ -492,7 +641,17 @@ app.get('/api/chats', authenticate, async (req, res, next) => {
       .populate('participants', POPULATE_FIELDS)
       .sort({ updatedAt: -1 })
       .limit(200);
-    res.json({ success: true, data: { conversations } });
+    const lastIds = conversations.map((c) => c.lastMessage && c.lastMessage.messageId).filter(Boolean);
+    const lastMsgs = lastIds.length ? await Message.find({ _id: { $in: lastIds } }).select('deliveredTo readBy') : [];
+    const lastMap = new Map(lastMsgs.map((m) => [m._id.toString(), m]));
+    const out = conversations.map((c) => {
+      const j = JSON.parse(JSON.stringify(c));
+      const lm = c.lastMessage && c.lastMessage.messageId ? lastMap.get(c.lastMessage.messageId.toString()) : null;
+      j.lastDeliveredTo = lm ? lm.deliveredTo.map(String) : [];
+      j.lastReadBy = lm ? lm.readBy.map(String) : [];
+      return j;
+    });
+    res.json({ success: true, data: { conversations: out } });
   } catch (error) {
     next(error);
   }
@@ -560,7 +719,8 @@ app.get('/api/chats/:chatId/messages', authenticate, async (req, res, next) => {
       .populate('senderId', 'displayName photoUrl')
       .sort({ createdAt: -1 })
       .limit(100);
-    res.json({ success: true, data: { messages: messages.reverse() } });
+    markDelivered(req.user._id, [conversation._id.toString()]).catch(() => {});
+    res.json({ success: true, data: { messages: messages.reverse().map(msgJson) } });
   } catch (error) {
     next(error);
   }
@@ -600,11 +760,19 @@ app.get('/api/media/:id', async (req, res, next) => {
     if (!doc || !doc.data) {
       return res.status(404).json({ success: false, message: 'Média introuvable.' });
     }
+    if (doc.viewOnce) {
+      try {
+        const p = jwt.verify(String(req.query.t || ''), process.env.JWT_SECRET);
+        if (p.m !== doc._id.toString()) throw new Error('bad');
+      } catch (_e) {
+        return res.status(403).json({ success: false, message: 'Média à vue unique.' });
+      }
+    }
     const total = doc.data.length;
     const base = {
       'Content-Type': doc.mimeType || 'application/octet-stream',
       'Accept-Ranges': 'bytes',
-      'Cache-Control': 'public, max-age=31536000, immutable',
+      'Cache-Control': doc.viewOnce ? 'private, no-store' : 'public, max-age=31536000, immutable',
       'Content-Disposition': `inline; filename="${encodeURIComponent(doc.fileName || 'file')}"`,
     };
     // Lecture partielle (nécessaire pour les vidéos / la barre de lecture des vocaux)
@@ -633,7 +801,7 @@ app.post('/api/chats/:chatId/messages', authenticate, async (req, res, next) => 
     if (!conversation) {
       return res.status(404).json({ success: false, message: 'Conversation introuvable.' });
     }
-    const { text, type, mediaUrl, fileName, mimeType, durationMs, lat, lng, forwarded, replyTo } = req.body || {};
+    const { text, type, mediaUrl, fileName, mimeType, durationMs, lat, lng, forwarded, replyTo, viewOnce } = req.body || {};
     const message = await createMessage({
       conversation,
       sender: req.user,
@@ -647,8 +815,123 @@ app.post('/api/chats/:chatId/messages', authenticate, async (req, res, next) => 
       lng,
       forwarded,
       replyTo,
+      viewOnce,
     });
     res.status(201).json({ success: true, data: { message } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─────────────────────────────────────────────
+// COCHES : REÇU / LU
+// ─────────────────────────────────────────────
+async function markDelivered(userId, onlyChatIds) {
+  const filter = onlyChatIds && onlyChatIds.length
+    ? { _id: { $in: onlyChatIds }, participants: userId }
+    : { participants: userId };
+  const convs = await Conversation.find(filter).select('_id participants').limit(500);
+  if (!convs.length) return;
+  const ids = convs.map((c) => c._id);
+  const pending = await Message.distinct('conversationId', { conversationId: { $in: ids }, senderId: { $ne: userId }, deliveredTo: { $ne: userId } });
+  if (!pending.length) return;
+  await Message.updateMany(
+    { conversationId: { $in: pending }, senderId: { $ne: userId }, deliveredTo: { $ne: userId } },
+    { $addToSet: { deliveredTo: userId } },
+  );
+  const pendingSet = new Set(pending.map((p) => p.toString()));
+  for (const c of convs) {
+    if (!pendingSet.has(c._id.toString())) continue;
+    for (const pid of c.participants) io.to(`user:${pid}`).emit('chat:delivered', { chatId: c._id.toString(), userId: userId.toString() });
+  }
+}
+
+app.post('/api/chats/:chatId/read', authenticate, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.chatId)) throw httpError(400, 'Identifiant invalide.');
+    const conversation = await Conversation.findOne({ _id: req.params.chatId, participants: req.user._id });
+    if (!conversation) throw httpError(404, 'Conversation introuvable.');
+    const r = await Message.updateMany(
+      { conversationId: conversation._id, senderId: { $ne: req.user._id }, readBy: { $ne: req.user._id } },
+      { $addToSet: { readBy: req.user._id, deliveredTo: req.user._id } },
+    );
+    if (r.modifiedCount) {
+      for (const pid of conversation.participants) {
+        io.to(`user:${pid}`).emit('chat:read', { chatId: conversation._id.toString(), userId: req.user._id.toString() });
+      }
+    }
+    res.json({ success: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// ─────────────────────────────────────────────
+// APPAREILS (notifications push)
+// ─────────────────────────────────────────────
+app.put('/api/devices', authenticate, async (req, res, next) => {
+  try {
+    const token = String((req.body && req.body.token) || '').trim();
+    const lang = LANGS.includes(req.body && req.body.lang) ? req.body.lang : 'fr';
+    if (token.length < 20 || token.length > 4096) throw httpError(400, 'Jeton invalide.');
+    // un appareil = un seul compte
+    await User.updateMany({ 'fcmTokens.token': token, _id: { $ne: req.user._id } }, { $pull: { fcmTokens: { token } } });
+    const updated = await User.updateOne({ _id: req.user._id, 'fcmTokens.token': token }, { $set: { 'fcmTokens.$.lang': lang, 'fcmTokens.$.updatedAt': new Date() } });
+    if (!updated.matchedCount) {
+      await User.updateOne({ _id: req.user._id }, { $push: { fcmTokens: { $each: [{ token, lang, updatedAt: new Date() }], $slice: -10 } } });
+    }
+    res.json({ success: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete('/api/devices', authenticate, async (req, res, next) => {
+  try {
+    const token = String(req.query.token || '').trim();
+    if (token) await User.updateOne({ _id: req.user._id }, { $pull: { fcmTokens: { token } } });
+    res.json({ success: true });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Ouverture d'un média à vue unique : une seule fois par destinataire
+app.post('/api/messages/:id/open-once', authenticate, async (req, res, next) => {
+  try {
+    const { message, conversation } = await loadMessageForUser(req.params.id, req.user._id);
+    if (!message.viewOnce || message.deleted) throw httpError(400, 'Ce message n’est pas à vue unique.');
+    if (String(message.senderId) === req.user._id.toString()) throw httpError(403, 'Tu ne peux pas rouvrir ton propre média.');
+    const claimed = await Message.findOneAndUpdate(
+      { _id: message._id, viewedBy: { $ne: req.user._id } },
+      { $addToSet: { viewedBy: req.user._id } },
+      { new: true },
+    );
+    if (!claimed) throw httpError(410, 'Déjà ouvert.');
+    const mid = /\/api\/media\/([a-f0-9]{24})/i.exec(message.mediaUrl || '');
+    if (!mid) throw httpError(404, 'Média introuvable.');
+    const t = jwt.sign({ m: mid[1], u: req.user._id.toString() }, process.env.JWT_SECRET, { expiresIn: '3m' });
+    await broadcastMessageUpdate(claimed, conversation);
+    res.json({ success: true, data: { url: `/api/media/${mid[1]}?t=${t}`, type: message.type, mimeType: message.mimeType } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Photo du groupe
+app.patch('/api/chats/:chatId', authenticate, async (req, res, next) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.chatId)) throw httpError(400, 'Identifiant invalide.');
+    const conversation = await Conversation.findOne({ _id: req.params.chatId, participants: req.user._id });
+    if (!conversation) throw httpError(404, 'Conversation introuvable.');
+    if (conversation.type !== 'group') throw httpError(400, 'Réservé aux groupes.');
+    if (conversation.slug) throw httpError(403, 'La photo d’une communauté ne peut pas être modifiée.');
+    if (req.body && req.body.photoUrl !== undefined) conversation.photoUrl = String(req.body.photoUrl).trim().slice(0, 500);
+    await conversation.save();
+    for (const pid of conversation.participants) {
+      io.to(`user:${pid}`).emit('chat:updated', { chatId: conversation._id.toString(), photoUrl: conversation.photoUrl });
+    }
+    res.json({ success: true, data: { photoUrl: conversation.photoUrl } });
   } catch (error) {
     next(error);
   }
@@ -668,7 +951,7 @@ async function loadMessageForUser(messageId, userId) {
 
 async function broadcastMessageUpdate(message, conversation) {
   const populated = await message.populate('senderId', 'displayName photoUrl');
-  const payload = JSON.parse(JSON.stringify(populated));
+  const payload = msgJson(populated);
   for (const pid of conversation.participants) io.to(`user:${pid}`).emit('message:update', payload);
   return payload;
 }
@@ -922,10 +1205,12 @@ io.use(async (socket, next) => {
 io.on('connection', (socket) => {
   // Chaque utilisateur reçoit TOUS ses messages (liste de discussions en temps réel)
   socket.join(`user:${socket.user._id}`);
+  // tout ce qui m'attendait est maintenant « reçu »
+  markDelivered(socket.user._id).catch(() => {});
 
   socket.on('message:send', async (data = {}, callback = () => {}) => {
     try {
-      const { chatId, text, type, mediaUrl, fileName, mimeType, durationMs, lat, lng, forwarded, replyTo } = data;
+      const { chatId, text, type, mediaUrl, fileName, mimeType, durationMs, lat, lng, forwarded, replyTo, viewOnce } = data;
       const conversation = await Conversation.findOne({ _id: chatId, participants: socket.user._id });
       if (!conversation) return callback({ success: false, message: 'Accès refusé.' });
       const payload = await createMessage({
@@ -941,6 +1226,7 @@ io.on('connection', (socket) => {
         lng,
         forwarded,
         replyTo,
+        viewOnce,
       });
       callback({ success: true, data: payload });
     } catch (error) {
