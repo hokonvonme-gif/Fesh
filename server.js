@@ -642,15 +642,33 @@ app.get('/api/chats', authenticate, async (req, res, next) => {
       .sort({ updatedAt: -1 })
       .limit(200);
     const lastIds = conversations.map((c) => c.lastMessage && c.lastMessage.messageId).filter(Boolean);
-    const lastMsgs = lastIds.length ? await Message.find({ _id: { $in: lastIds } }).select('deliveredTo readBy') : [];
+    const lastMsgs = lastIds.length ? await Message.find({ _id: { $in: lastIds } }).select('deliveredTo readBy deleted deletedFor') : [];
     const lastMap = new Map(lastMsgs.map((m) => [m._id.toString(), m]));
-    const out = conversations.map((c) => {
+    const me = req.user._id.toString();
+    const previewOf = (m) => (m.viewOnce ? '🔒' : m.type === 'image' ? '📷 Photo' : m.type === 'audio' ? '🎤 Message vocal' : m.type === 'file' ? `📎 ${m.fileName || 'Fichier'}` : m.type === 'location' ? '📍 Position' : m.text || '');
+    const out = await Promise.all(conversations.map(async (c) => {
       const j = JSON.parse(JSON.stringify(c));
-      const lm = c.lastMessage && c.lastMessage.messageId ? lastMap.get(c.lastMessage.messageId.toString()) : null;
-      j.lastDeliveredTo = lm ? lm.deliveredTo.map(String) : [];
-      j.lastReadBy = lm ? lm.readBy.map(String) : [];
+      let lm = c.lastMessage && c.lastMessage.messageId ? lastMap.get(c.lastMessage.messageId.toString()) : null;
+      if (lm && (lm.deletedFor || []).some((id) => id.toString() === me)) {
+        // dernier message supprimé « pour moi » : on retombe sur le précédent message visible
+        const prev = await Message.findOne({ conversationId: c._id, deletedFor: { $ne: req.user._id } }).sort({ createdAt: -1 });
+        if (prev) {
+          j.lastMessage = {
+            text: prev.deleted ? '' : previewOf(prev), type: prev.deleted ? 'deleted' : prev.type, durationMs: prev.durationMs || 0,
+            senderId: prev.senderId, messageId: prev._id, createdAt: prev.createdAt,
+          };
+          lm = prev;
+        } else {
+          j.lastMessage = { text: '', type: 'text' };
+          lm = null;
+        }
+      } else if (lm && lm.deleted) {
+        j.lastMessage = { ...j.lastMessage, text: '', type: 'deleted' };
+      }
+      j.lastDeliveredTo = lm ? (lm.deliveredTo || []).map(String) : [];
+      j.lastReadBy = lm ? (lm.readBy || []).map(String) : [];
       return j;
-    });
+    }));
     res.json({ success: true, data: { conversations: out } });
   } catch (error) {
     next(error);
@@ -824,6 +842,70 @@ app.post('/api/chats/:chatId/messages', authenticate, async (req, res, next) => 
 });
 
 // ─────────────────────────────────────────────
+// SUPPRESSION RÉELLE (libère l'espace dans la base)
+// ─────────────────────────────────────────────
+function mediaIdFromUrl(url) {
+  const m = /\/api\/media\/([a-f0-9]{24})/i.exec(String(url || ''));
+  return m ? m[1] : null;
+}
+
+// Supprime le fichier de la base s'il n'est plus utilisé nulle part
+// (un message transféré peut partager le même fichier).
+async function purgeMediaIfUnused(url) {
+  try {
+    const id = mediaIdFromUrl(url);
+    if (!id) return;
+    const re = new RegExp(`/api/media/${id}`);
+    const used = await Promise.all([
+      Message.exists({ mediaUrl: re }),
+      Status.exists({ mediaUrl: re }),
+      User.exists({ $or: [{ photoUrl: re }, { statusMediaUrl: re }] }),
+      Conversation.exists({ photoUrl: re }),
+    ]);
+    if (used.some(Boolean)) return;
+    await Media.deleteOne({ _id: id });
+  } catch (err) {
+    console.error('purgeMedia:', err.message);
+  }
+}
+
+// Remet à jour l'aperçu de la liste après une suppression définitive
+async function refreshConversationLast(conversationId) {
+  const last = await Message.findOne({ conversationId }).sort({ createdAt: -1 });
+  if (!last) {
+    await Conversation.updateOne({ _id: conversationId }, { $unset: { lastMessage: 1 } });
+    return;
+  }
+  const text = last.viewOnce ? '🔒' : last.type === 'image' ? '📷 Photo' : last.type === 'audio' ? '🎤 Message vocal' : last.type === 'file' ? `📎 ${last.fileName || 'Fichier'}` : last.type === 'location' ? '📍 Position' : last.text || '';
+  await Conversation.updateOne({ _id: conversationId }, { $set: { lastMessage: { text, type: last.type, durationMs: last.durationMs || 0, senderId: last.senderId, messageId: last._id, createdAt: last.createdAt } } });
+}
+
+async function hardDeleteMessage(message, conversation) {
+  const url = message.mediaUrl;
+  await Message.deleteOne({ _id: message._id });
+  await purgeMediaIfUnused(url);
+  await refreshConversationLast(conversation._id);
+}
+
+// Nettoyage périodique : fichiers qui ne sont plus référencés par rien
+async function sweepOrphanMedia() {
+  try {
+    const refs = new Set();
+    const lists = await Promise.all([
+      Message.distinct('mediaUrl'), Status.distinct('mediaUrl'), User.distinct('photoUrl'),
+      User.distinct('statusMediaUrl'), Conversation.distinct('photoUrl'),
+    ]);
+    for (const l of lists) for (const u of l) { const id = mediaIdFromUrl(u); if (id) refs.add(id); }
+    const old = await Media.find({ createdAt: { $lt: new Date(Date.now() - 60 * 60 * 1000) } }).select('_id');
+    const dead = old.map((m) => m._id.toString()).filter((id) => !refs.has(id));
+    for (let i = 0; i < dead.length; i += 200) await Media.deleteMany({ _id: { $in: dead.slice(i, i + 200) } });
+    if (dead.length) console.log(`Nettoyage : ${dead.length} fichier(s) orphelin(s) supprimé(s).`);
+  } catch (err) {
+    console.error('sweepOrphanMedia:', err.message);
+  }
+}
+
+// ─────────────────────────────────────────────
 // COCHES : REÇU / LU
 // ─────────────────────────────────────────────
 async function markDelivered(userId, onlyChatIds) {
@@ -912,6 +994,14 @@ app.post('/api/messages/:id/open-once', authenticate, async (req, res, next) => 
     if (!mid) throw httpError(404, 'Média introuvable.');
     const t = jwt.sign({ m: mid[1], u: req.user._id.toString() }, process.env.JWT_SECRET, { expiresIn: '3m' });
     await broadcastMessageUpdate(claimed, conversation);
+    const others = conversation.participants.filter((pid) => pid.toString() !== String(message.senderId));
+    if (others.every((pid) => claimed.viewedBy.some((v) => v.toString() === pid.toString()))) {
+      // tout le monde l'a vu : le fichier est supprimé de la base (après le délai du jeton)
+      setTimeout(async () => {
+        await Message.updateOne({ _id: claimed._id }, { $set: { mediaUrl: '', fileName: '' } });
+        await Media.deleteOne({ _id: mid[1] });
+      }, 4 * 60 * 1000).unref();
+    }
     res.json({ success: true, data: { url: `/api/media/${mid[1]}?t=${t}`, type: message.type, mimeType: message.mimeType } });
   } catch (error) {
     next(error);
@@ -983,16 +1073,24 @@ app.delete('/api/messages/:id', authenticate, async (req, res, next) => {
     const forAll = req.query.forAll === '1' || req.query.forAll === 'true';
     if (forAll) {
       if (String(message.senderId) !== req.user._id.toString()) throw httpError(403, 'Tu ne peux supprimer pour tous que tes propres messages.');
+      // 1) on prévient les écrans ouverts, 2) on efface réellement le message et son fichier
+      const mediaUrl = message.mediaUrl;
       message.deleted = true;
       message.text = '';
       message.mediaUrl = '';
       message.fileName = '';
       message.reactions = [];
       message.reply = undefined;
-      await message.save();
       await broadcastMessageUpdate(message, conversation);
+      await Message.deleteOne({ _id: message._id });
+      await purgeMediaIfUnused(mediaUrl);
+      await refreshConversationLast(conversation._id);
     } else {
-      await Message.updateOne({ _id: message._id }, { $addToSet: { deletedFor: req.user._id } });
+      const m2 = await Message.findOneAndUpdate({ _id: message._id }, { $addToSet: { deletedFor: req.user._id } }, { new: true });
+      // si tous les participants l'ont supprimé, plus personne n'en a besoin : suppression réelle
+      if (m2 && conversation.participants.every((pid) => m2.deletedFor.some((d) => d.toString() === pid.toString()))) {
+        await hardDeleteMessage(m2, conversation);
+      }
     }
     res.json({ success: true });
   } catch (error) {
@@ -1098,8 +1196,9 @@ app.post('/api/statuses/:id/view', authenticate, async (req, res, next) => {
 app.delete('/api/statuses/:id', authenticate, async (req, res, next) => {
   try {
     if (!mongoose.isValidObjectId(req.params.id)) throw httpError(400, 'Identifiant invalide.');
-    const r = await Status.deleteOne({ _id: req.params.id, userId: req.user._id });
-    if (!r.deletedCount) throw httpError(404, 'Statut introuvable.');
+    const st = await Status.findOneAndDelete({ _id: req.params.id, userId: req.user._id });
+    if (!st) throw httpError(404, 'Statut introuvable.');
+    await purgeMediaIfUnused(st.mediaUrl);
     statusAudience(req.user._id)
       .then((ids) => ids.forEach((id) => io.to(`user:${id}`).emit('status:changed', { userId: req.user._id.toString() })))
       .catch(() => {});
@@ -1305,6 +1404,8 @@ connectDatabase()
   .then(seedCommunities)
   .then(() => {
     server.listen(PORT, '0.0.0.0', () => console.log(`Fesh API running on port ${PORT}`));
+    setTimeout(sweepOrphanMedia, 60 * 1000).unref();
+    setInterval(sweepOrphanMedia, 6 * 60 * 60 * 1000).unref();
   })
   .catch((error) => {
     console.error('Impossible de démarrer :', error.message);
