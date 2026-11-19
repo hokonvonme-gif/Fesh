@@ -1,3 +1,4 @@
+const crypto = require('crypto');
 require('dotenv').config();
 
 const http = require('http');
@@ -562,6 +563,16 @@ app.post('/api/auth/login', authLimiter, async (req, res, next) => {
   } catch (error) {
     next(error);
   }
+});
+
+// Serveurs STUN / TURN pour les appels (TURN_URLS="turn:host:3478,turns:host:5349", TURN_USERNAME, TURN_CREDENTIAL)
+app.get('/api/calls/ice', authenticate, (_req, res) => {
+  const iceServers = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }];
+  const urls = String(process.env.TURN_URLS || '').split(',').map((u) => u.trim()).filter(Boolean);
+  if (urls.length && process.env.TURN_USERNAME && process.env.TURN_CREDENTIAL) {
+    iceServers.push({ urls, username: process.env.TURN_USERNAME, credential: process.env.TURN_CREDENTIAL });
+  }
+  res.json({ success: true, data: { iceServers } });
 });
 
 app.get('/api/auth/me', authenticate, (req, res) => {
@@ -1267,7 +1278,7 @@ app.get('/', (_req, res) => res.json({ success: true, name: 'Fesh API', health: 
 app.get('/health', (_req, res) => res.json({ success: true, status: 'ok', service: 'fesh-backend' }));
 
 app.use((req, res) => {
-  res.status(404).json({ success: false, message: `Route introuvable: ${req.method} ${req.originalUrl}` });
+  res.status(404).json({ success: false, message: 'Ressource introuvable.' });
 });
 
 app.use((err, _req, res, _next) => {
@@ -1277,7 +1288,7 @@ app.use((err, _req, res, _next) => {
     return res.status(413).json({ success: false, message: 'Fichier trop volumineux (12 Mo max).' });
   }
   if (status >= 500) console.error(err);
-  const hide = status >= 500 && process.env.NODE_ENV === 'production';
+  const hide = status >= 500;
   res.status(status).json({
     success: false,
     message: hide ? 'Erreur interne du serveur.' : (err.message || 'Erreur interne du serveur.'),
@@ -1333,48 +1344,199 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ── WebRTC signaling (1-1 calls) ─────────────────────────
-  socket.on('call:invite', ({ toUserId, chatId, callType, offer } = {}) => {
-    if (!toUserId) return;
-    io.to(`user:${toUserId}`).emit('call:invite', {
-      fromUserId: String(socket.user._id),
-      fromName: socket.user.displayName,
-      chatId,
-      callType: callType === 'video' ? 'video' : 'audio',
-      offer,
-    });
+  // ── Appels audio / vidéo : 1-1, groupes et réunions (WebRTC, signalisation) ─────────
+  const me = () => String(socket.user._id);
+  const ack = (cb, payload) => { if (typeof cb === 'function') cb(payload); };
+
+  // Démarrer un appel (direct, groupe) ou une réunion
+  socket.on('call:start', async ({ chatId, callType, kind } = {}, cb) => {
+    try {
+      const type = callType === 'video' ? 'video' : 'audio';
+      let call;
+      if (kind === 'meeting') {
+        call = createCall({ hostId: me(), hostName: socket.user.displayName, type, kind: 'meeting', title: '', chatId: '' });
+      } else {
+        const conv = await Conversation.findOne({ _id: chatId, participants: socket.user._id });
+        if (!conv) return ack(cb, { success: false });
+        const isGroup = conv.type === 'group';
+        call = createCall({
+          hostId: me(), hostName: socket.user.displayName, type,
+          kind: isGroup ? 'group' : 'direct', title: isGroup ? conv.title : '', chatId: String(conv._id),
+        });
+        call.invited = conv.participants.map(String).filter((id) => id !== me()).slice(0, 30);
+        ringUsers(call, call.invited);
+      }
+      call.members.set(me(), socket.user.displayName);
+      socket.join(`call:${call.id}`);
+      ack(cb, { success: true, callId: call.id, code: call.code, peers: [] });
+    } catch (_e) { ack(cb, { success: false }); }
   });
 
-  socket.on('call:answer', ({ toUserId, answer } = {}) => {
-    if (!toUserId) return;
-    io.to(`user:${toUserId}`).emit('call:answer', {
-      fromUserId: String(socket.user._id),
-      answer,
-    });
+  // Rejoindre un appel (via une invitation ou le code d'une réunion)
+  let badCodes = 0;
+  socket.on('call:join', ({ callId, code } = {}, cb) => {
+    if (!callId) {
+      // anti force brute sur les codes de réunion (6 chiffres)
+      if (badCodes >= 10) return ack(cb, { success: false, message: 'ended' });
+    }
+    const call = callId ? calls.get(String(callId)) : callByCode(code);
+    if (!call) {
+      if (!callId) { badCodes += 1; setTimeout(() => { badCodes = Math.max(0, badCodes - 1); }, 60 * 1000).unref(); }
+      return ack(cb, { success: false, message: 'ended' });
+    }
+    // un appel direct / de groupe n'est accessible qu'aux personnes invitées
+    if (call.kind !== 'meeting' && !call.members.has(me()) && !call.invited.includes(me())) {
+      return ack(cb, { success: false, message: 'ended' });
+    }
+    const peers = [...call.members.entries()].filter(([id]) => id !== me()).map(([id, name]) => ({ userId: id, name }));
+    if (call.members.size >= MAX_CALL_MEMBERS && !call.members.has(me())) return ack(cb, { success: false, message: 'full' });
+    call.members.set(me(), socket.user.displayName);
+    call.answered = true;
+    socket.join(`call:${call.id}`);
+    socket.to(`call:${call.id}`).emit('call:peer-joined', { callId: call.id, userId: me(), name: socket.user.displayName });
+    // l'appel est pris : les autres appareils de cet utilisateur arrêtent de sonner
+    socket.to(`user:${me()}`).emit('call:handled', { callId: call.id });
+    ack(cb, { success: true, callId: call.id, callType: call.type, kind: call.kind, title: call.title, chatId: call.chatId, code: call.code, peers });
   });
 
-  socket.on('call:ice', ({ toUserId, candidate } = {}) => {
-    if (!toUserId || !candidate) return;
-    io.to(`user:${toUserId}`).emit('call:ice', {
-      fromUserId: String(socket.user._id),
-      candidate,
-    });
+  // Inviter d'autres personnes dans un appel / une réunion en cours
+  socket.on('call:invite', async ({ callId, userIds } = {}, cb) => {
+    const call = calls.get(String(callId));
+    if (!call || !call.members.has(me()) || !Array.isArray(userIds)) return ack(cb, { success: false });
+    const ids = userIds.map(String).filter((id) => id !== me() && !call.members.has(id)).slice(0, 20);
+    ringUsers(call, ids);
+    ack(cb, { success: true });
   });
 
-  socket.on('call:hangup', ({ toUserId } = {}) => {
-    if (!toUserId) return;
-    io.to(`user:${toUserId}`).emit('call:hangup', {
-      fromUserId: String(socket.user._id),
-    });
+  // Relais des messages WebRTC (offer / answer / ice) vers un participant précis
+  socket.on('call:signal', ({ callId, toUserId, data } = {}) => {
+    const call = calls.get(String(callId));
+    if (!call || !call.members.has(me()) || !toUserId || !data) return;
+    io.to(`user:${toUserId}`).emit('call:signal', { callId: call.id, fromUserId: me(), data });
   });
 
-  socket.on('call:reject', ({ toUserId } = {}) => {
-    if (!toUserId) return;
-    io.to(`user:${toUserId}`).emit('call:reject', {
-      fromUserId: String(socket.user._id),
-    });
+  socket.on('call:reject', ({ callId } = {}) => {
+    const call = calls.get(String(callId));
+    if (!call) return;
+    call.invited = call.invited.filter((id) => id !== me());
+    socket.to(`user:${me()}`).emit('call:handled', { callId: call.id });
+    io.to(`user:${call.hostId}`).emit('call:rejected', { callId: call.id, userId: me() });
+    closeIfEmpty(call);
   });
+
+  socket.on('call:leave', ({ callId } = {}) => leaveCall(String(callId), socket));
+  socket.on('disconnect', () => {
+    for (const call of [...calls.values()]) if (call.members.has(me())) leaveCall(call.id, socket);
+  });
+
+  // Après une reconnexion : rejoue les appels qui sonnent encore
+  for (const call of calls.values()) {
+    if (!call.answered && call.invited.includes(me()) && Date.now() - call.createdAt < RING_MS) {
+      socket.emit('call:incoming', callPayload(call));
+    }
+  }
 });
+
+// ─────────────────────────────────────────────
+// APPELS : état en mémoire (une salle par appel)
+// ─────────────────────────────────────────────
+const calls = new Map(); // callId -> { id, code, hostId, type, kind, title, chatId, members:Map, invited:[], answered, createdAt }
+const MAX_CALL_MEMBERS = 8; // maillage WebRTC : au-delà la qualité s'effondre
+const RING_MS = 45 * 1000;
+
+function createCall({ hostId, hostName, type, kind, title, chatId }) {
+  const id = crypto.randomBytes(9).toString('hex');
+  let code = '';
+  if (kind === 'meeting') {
+    do { code = String(crypto.randomInt(0, 1000000)).padStart(6, '0'); } while (callByCode(code));
+  }
+  const call = { id, code, hostId, hostName, type, kind, title, chatId, members: new Map(), invited: [], answered: false, createdAt: Date.now() };
+  calls.set(id, call);
+  // sécurité : une salle ne reste jamais plus de 6 h
+  setTimeout(() => calls.delete(id), 6 * 60 * 60 * 1000).unref();
+  return call;
+}
+
+function callByCode(code) {
+  const c = String(code || '').replace(/\D/g, '');
+  if (c.length !== 6) return null;
+  for (const call of calls.values()) if (call.code === c) return call;
+  return null;
+}
+
+function callPayload(call) {
+  return { callId: call.id, fromUserId: call.hostId, fromName: call.hostName, chatId: call.chatId, title: call.title, callType: call.type, kind: call.kind };
+}
+
+function ringUsers(call, userIds) {
+  for (const id of userIds) {
+    if (!call.invited.includes(id)) call.invited.push(id);
+    io.to(`user:${id}`).emit('call:incoming', callPayload(call));
+  }
+  sendPushForCall(call, userIds).catch(() => {});
+  // personne n'a répondu : appel manqué
+  setTimeout(() => {
+    const c = calls.get(call.id);
+    if (!c) return;
+    const pending = userIds.filter((id) => c.invited.includes(id) && !c.members.has(id));
+    for (const id of pending) io.to(`user:${id}`).emit('call:missed', { callId: c.id, fromName: c.hostName, callType: c.type, chatId: c.chatId, title: c.title });
+    c.invited = c.invited.filter((id) => !pending.includes(id));
+    closeIfEmpty(c);
+  }, RING_MS + 1000).unref();
+}
+
+function endCall(call) {
+  io.to(`call:${call.id}`).emit('call:ended', { callId: call.id });
+  for (const id of call.invited) io.to(`user:${id}`).emit('call:handled', { callId: call.id });
+  calls.delete(call.id);
+}
+
+// Ferme l'appel quand il n'y a plus personne à qui parler (jamais pour une réunion)
+function closeIfEmpty(call) {
+  if (call.kind === 'meeting') return;
+  const waiting = call.invited.some((id) => !call.members.has(id));
+  if (call.members.size <= 1 && !waiting) endCall(call);
+}
+
+function leaveCall(callId, socket) {
+  const call = calls.get(callId);
+  const uid = String(socket.user._id);
+  if (!call || !call.members.has(uid)) return;
+  call.members.delete(uid);
+  socket.leave(`call:${callId}`);
+  io.to(`call:${callId}`).emit('call:peer-left', { callId, userId: uid });
+  if (call.members.size === 0) {
+    // l'appelant raccroche avant qu'on décroche : appel manqué pour les invités
+    if (!call.answered) {
+      for (const id of call.invited) io.to(`user:${id}`).emit('call:missed', { callId, fromName: call.hostName, callType: call.type, chatId: call.chatId, title: call.title });
+    }
+    endCall(call);
+  } else {
+    closeIfEmpty(call);
+  }
+}
+
+async function sendPushForCall(call, userIds) {
+  if (!fcm || !userIds.length) return;
+  const users = await User.find({ _id: { $in: userIds } }).select('+fcmTokens');
+  const tokens = [];
+  for (const u of users) for (const d of u.fcmTokens || []) tokens.push(d.token);
+  if (!tokens.length) return;
+  const title = call.kind === 'group' && call.title ? call.title : call.hostName;
+  const body = call.type === 'video' ? 'Appel vidéo entrant' : 'Appel vocal entrant';
+  for (let i = 0; i < tokens.length; i += 500) {
+    try {
+      await fcm.sendEachForMulticast({
+        tokens: tokens.slice(i, i + 500),
+        notification: { title, body },
+        data: { type: 'call', chatId: call.chatId || '', callId: call.id, title, body },
+        android: { priority: 'high', ttl: 45 * 1000, notification: { channelId: 'fesh_messages', sound: 'default', defaultSound: true } },
+      });
+    } catch (err) {
+      console.error('Push appel erreur :', err.message);
+    }
+  }
+}
 
 // ─────────────────────────────────────────────
 // START
