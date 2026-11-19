@@ -275,12 +275,12 @@ const COMMUNITY_TITLES = {"international": {"fr": "Étudiants internationaux", "
 
 function pushBody(lang, msg) {
   const t = PUSH_TXT[lang] || PUSH_TXT.fr;
-  if (msg.viewOnce) return `🔒 ${t.once}`;
+  if (msg.viewOnce) return t.once;
   switch (msg.type) {
-    case 'audio': return `🎤 ${t.voice}`;
-    case 'image': return `📷 ${msg.text ? msg.text : t.photo}`;
-    case 'file': return `📎 ${msg.fileName || t.file}`;
-    case 'location': return `📍 ${t.location}`;
+    case 'audio': return t.voice;
+    case 'image': return msg.text ? msg.text : t.photo;
+    case 'file': return msg.fileName || t.file;
+    case 'location': return t.location;
     default: return msg.text || t.msg;
   }
 }
